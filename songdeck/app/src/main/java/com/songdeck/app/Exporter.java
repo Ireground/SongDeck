@@ -54,7 +54,7 @@ public final class Exporter {
     public static void writeMidi(Project p, OutputStream os) throws IOException {
         double ticksPerSample = (p.tempo / 60.0) * PPQ / SR;
         List<long[]> ev = new ArrayList<>(); // {tick, order, status, data1, data2}
-        for (Project.Note n : p.notes) {
+        for (Project.Note n : p.flatNotes()) {
             long on = Math.round(n.start * ticksPerSample);
             long off = Math.max(on + 1, Math.round(n.end() * ticksPerSample));
             int pitch = Math.max(0, Math.min(127, n.pitch));

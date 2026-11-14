@@ -204,8 +204,7 @@ public class MainActivity extends Activity {
         StringBuilder d = new StringBuilder();
         d.append(date).append("   •   ").append(String.format(Locale.US, "%d:%02d", secs / 60, secs % 60));
         d.append("   •   ").append(p.tempo).append(" BPM");
-        d.append("   •   ").append(p.clips.size()).append(p.clips.size() == 1 ? " clip" : " clips");
-        d.append("   •   ").append(p.notes.size()).append(p.notes.size() == 1 ? " note" : " notes");
+        d.append("   •   ").append(p.clips.size() + p.midiClips.size() == 1 ? "1 clip" : (p.clips.size() + p.midiClips.size()) + " clips");
         if (currentFolder.equals(ALL)) {
             String fname = "Unsorted";
             for (Store.Folder f : folders) if (f.id.equals(p.folderId)) fname = f.name;

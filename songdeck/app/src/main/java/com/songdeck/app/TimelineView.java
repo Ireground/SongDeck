@@ -3,6 +3,7 @@ package com.songdeck.app;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.os.Handler;
@@ -13,7 +14,13 @@ import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewConfiguration;
 
-/** Ruler + vocal track + keyboard track, with track headers on the left. */
+import java.util.List;
+
+/**
+ * Ruler + vocal track + keyboard track, with track headers on the left.
+ * Both tracks hold clips: touch a clip and drag to move it, drag a selected clip's
+ * edge to trim it (snaps to the grid), hold still on a clip for its menu.
+ */
 public class TimelineView extends View {
 
     public static final int PEAK_STEP = 128;
@@ -24,14 +31,15 @@ public class TimelineView extends View {
         boolean isPlaying();
         boolean isRecording();
         long recordStart();
+        List<Project.Note> recordingNotes();
         float[] peaks(String src);
-        Project.Clip selected();
-        void select(Project.Clip c);
+        int sourceLength(String src);
+        Object selected();
+        void select(Object clip);
         void seek(long pos);
-        void deleteClip(Project.Clip c);
-        void deleteNote(Project.Note n);
         void beginEdit();
-        void clipMoved();
+        void clipsChanged();
+        void clipMenu(Object clip);
         void toggleArm(int track);
         void toggleMute(int track);
         void setVolume(int track, float v, boolean done);
@@ -54,17 +62,21 @@ public class TimelineView extends View {
     private float[] lines = new float[4096];
 
     // touch
-    private static final int NONE = 0, PENDING = 1, SCROLL = 2, MOVE_CLIP = 3, SEEK = 4, VOL = 5;
+    private static final int NONE = 0, PENDING = 1, SCROLL = 2, MOVE = 3, TRIM_L = 4, TRIM_R = 5,
+            RULER = 6, VOL = 7;
     private int mode = NONE;
+    private int pendingTrim;      // TRIM_L / TRIM_R if the finger went down on a selected clip's edge
+    private Object touchClip;     // clip under the finger at touch down
     private int volTrack;
     private float downX, downY;
     private double downView;
-    private long clipOrigStart;
-    private Project.Clip dragClip;
+    private long origStart, origLen, origOffset;
+    private int origSrcStart;
     private final int slop;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ScaleGestureDetector scaler;
     private boolean scaling;
+    private double scaleAnchor;
 
     public TimelineView(Context c) {
         super(c);
@@ -74,20 +86,20 @@ public class TimelineView extends View {
         scaler = new ScaleGestureDetector(c, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScaleBegin(ScaleGestureDetector d) {
+                if (mode == MOVE || mode == TRIM_L || mode == TRIM_R) return false;
                 scaling = true;
                 mode = NONE;
                 handler.removeCallbacks(longPress);
+                scaleAnchor = viewStart + (d.getFocusX() - headerW) * spp;
                 return true;
             }
 
             @Override
             public boolean onScale(ScaleGestureDetector d) {
-                float fx = d.getFocusX() - headerW;
-                double anchor = viewStart + fx * spp;
                 float ns = spp / d.getScaleFactor();
-                ns = Math.max(SR / (float) Ui.dp(600), Math.min(SR / (float) Ui.dp(4), ns));
-                spp = ns;
-                viewStart = Math.max(0, anchor - fx * spp);
+                spp = Math.max(SR / (float) Ui.dp(900), Math.min(SR / (float) Ui.dp(4), ns));
+                // two fingers: zoom around the fingers and follow them sideways
+                viewStart = Math.max(0, scaleAnchor - (d.getFocusX() - headerW) * spp);
                 invalidate();
                 return true;
             }
@@ -99,7 +111,7 @@ public class TimelineView extends View {
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
         headerW = Ui.dp(w > Ui.dp(900) ? 170 : 140);
-        rulerH = Ui.dp(26);
+        rulerH = Ui.dp(28);
         laneGap = Ui.dp(5);
         float laneH = (h - rulerH - laneGap * 2) / 2f;
         vocalLane.set(headerW, rulerH + laneGap, w, rulerH + laneGap + laneH);
@@ -108,6 +120,19 @@ public class TimelineView extends View {
 
     private float xOf(long sample) { return headerW + (float) ((sample - viewStart) / spp); }
     private long sampleAt(float x) { return Math.max(0, Math.round(viewStart + (x - headerW) * spp)); }
+
+    /** Snap step that suits the zoom: 1/16, 1/8, beat or bar. */
+    private long gridStep() {
+        long beat = host.project().beatLen();
+        long[] steps = {beat / 4, beat / 2, beat, beat * 4};
+        for (long s : steps) if (s / spp >= Ui.dp(14)) return s;
+        return beat * 4;
+    }
+
+    private long snap(long v) {
+        long g = gridStep();
+        return Math.max(0, Math.round(v / (double) g) * g);
+    }
 
     /** Keeps the playhead on screen while playing. */
     public void follow() {
@@ -129,41 +154,38 @@ public class TimelineView extends View {
         c.drawColor(Ui.BG);
         long beat = pr.beatLen();
 
-        // lanes background
         p.setColor(0xFF0A1726);
         c.drawRect(vocalLane, p);
         p.setColor(0xFF111317);
         c.drawRect(keysLane, p);
 
-        drawPianoRollRows(c, pr);
         drawGrid(c, beat, W);
         drawClips(c, pr);
-        drawNotes(c, pr);
+        drawMidiClips(c, pr);
 
-        // recording region
-        if (host.isRecording() && pr.vocalArm) {
+        if (host.isRecording()) {
             float x0 = Math.max(headerW, xOf(host.recordStart()));
             float x1 = xOf(host.playhead());
             if (x1 > x0) {
-                p.setColor(0x55E5484D);
-                c.drawRect(x0, vocalLane.top, x1, vocalLane.bottom, p);
+                p.setColor(0x44E5484D);
+                if (pr.vocalArm) c.drawRect(x0, vocalLane.top, x1, vocalLane.bottom, p);
+                if (pr.keysArm) c.drawRect(x0, keysLane.top, x1, keysLane.bottom, p);
             }
+            drawRecordingNotes(c, pr);
         }
 
-        drawRuler(c, pr, beat, W);
+        drawRuler(c, beat, W);
 
-        // playhead
         float px = xOf(host.playhead());
         if (px >= headerW && px <= W) {
             p.setColor(host.isRecording() ? Ui.RED : 0xFFFFFFFF);
             p.setStrokeWidth(Ui.dp(2));
             c.drawLine(px, 0, px, H, p);
         }
-        // start cursor marker
         float cx = xOf(pr.cursor);
         if (cx >= headerW - 1 && cx <= W) {
             p.setColor(Ui.BLUE);
-            android.graphics.Path tri = new android.graphics.Path();
+            Path tri = new Path();
             tri.moveTo(cx - Ui.dp(7), 0);
             tri.lineTo(cx + Ui.dp(7), 0);
             tri.lineTo(cx, Ui.dp(10));
@@ -174,7 +196,7 @@ public class TimelineView extends View {
         drawHeaders(c, pr);
     }
 
-    private void drawRuler(Canvas c, Project pr, long beat, int W) {
+    private void drawRuler(Canvas c, long beat, int W) {
         p.setColor(Ui.PANEL);
         c.drawRect(headerW, 0, W, rulerH, p);
         long first = (long) Math.max(0, Math.floor(viewStart / beat));
@@ -188,6 +210,7 @@ public class TimelineView extends View {
             float x = xOf(b * beat);
             if (x < headerW) continue;
             boolean bar = b % 4 == 0;
+            if (!bar && beatPx < Ui.dp(5)) continue;
             p.setColor(bar ? 0xFF59616E : 0xFF353B45);
             c.drawLine(x, bar ? 0 : rulerH * 0.55f, x, rulerH, p);
             if (bar && (beatPx * 4 > Ui.dp(26) || (b / 4) % 4 == 0)) {
@@ -212,35 +235,20 @@ public class TimelineView extends View {
         }
     }
 
-    private int[] noteRange(Project pr) {
-        int lo = 127, hi = 0;
-        for (Project.Note n : pr.notes) { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); }
-        if (lo > hi) { lo = 12 * (pr.octave + 1); hi = lo + 23; }
-        lo -= 1; hi += 1;
-        while (hi - lo + 1 < 12) { lo--; hi++; }
-        return new int[]{Math.max(0, lo), Math.min(127, hi)};
-    }
-
-    private void drawPianoRollRows(Canvas c, Project pr) {
-        int[] rg = noteRange(pr);
-        int rows = rg[1] - rg[0] + 1;
-        float rh = keysLane.height() / rows;
-        for (int i = 0; i < rows; i++) {
-            int n = rg[1] - i;
-            int pc = n % 12;
-            boolean black = pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10;
-            p.setColor(black ? 0xFF0B0C0F : 0xFF14171C);
-            float y = keysLane.top + i * rh;
-            c.drawRect(keysLane.left, y, keysLane.right, y + rh, p);
-            if (pc == 0) {
-                p.setColor(0x22FFFFFF);
-                c.drawLine(keysLane.left, y + rh, keysLane.right, y + rh, p);
-            }
+    private void handles(Canvas c, RectF box) {
+        p.setColor(0xFFFFFFFF);
+        float hw = Ui.dp(5), hh = Math.min(box.height() * 0.5f, Ui.dp(34));
+        float cy = box.centerY();
+        if (box.left >= headerW - 1) {
+            r.set(box.left, cy - hh / 2, box.left + hw, cy + hh / 2);
+            c.drawRoundRect(r, Ui.dp(2), Ui.dp(2), p);
         }
+        r.set(box.right - hw, cy - hh / 2, box.right, cy + hh / 2);
+        c.drawRoundRect(r, Ui.dp(2), Ui.dp(2), p);
     }
 
     private void drawClips(Canvas c, Project pr) {
-        Project.Clip sel = host.selected();
+        Object sel = host.selected();
         float top = vocalLane.top + Ui.dp(3), bot = vocalLane.bottom - Ui.dp(3);
         float mid = (top + bot) / 2, half = (bot - top) / 2 * 0.92f;
         if (pr.clips.isEmpty() && !host.isRecording()) {
@@ -253,11 +261,10 @@ public class TimelineView extends View {
             float x0 = xOf(cl.start), x1 = xOf(cl.end());
             if (x1 < headerW || x0 > getWidth()) continue;
             boolean isSel = cl == sel;
-            r.set(Math.max(x0, headerW - Ui.dp(4)), top, x1, bot);
+            RectF box = new RectF(Math.max(x0, headerW - Ui.dp(4)), top, x1, bot);
             p.setStyle(Paint.Style.FILL);
             p.setColor(isSel ? 0xFF1C4677 : 0xFF132C4A);
-            c.drawRoundRect(r, Ui.dp(4), Ui.dp(4), p);
-            // waveform
+            c.drawRoundRect(box, Ui.dp(4), Ui.dp(4), p);
             float[] pk = host.peaks(cl.src);
             int from = (int) Math.max(Math.ceil(x0), headerW), to = (int) Math.min(Math.floor(x1), getWidth());
             int cnt = 0;
@@ -276,39 +283,86 @@ public class TimelineView extends View {
                 p.setStrokeWidth(1);
                 c.drawLines(lines, 0, cnt, p);
             }
-            if (isSel) {
-                p.setStyle(Paint.Style.STROKE);
-                p.setStrokeWidth(Ui.dp(2));
-                p.setColor(Ui.BLUE);
-                c.drawRoundRect(r, Ui.dp(4), Ui.dp(4), p);
-                p.setStyle(Paint.Style.FILL);
-            }
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(Ui.dp(isSel ? 2 : 1));
+            p.setColor(isSel ? Ui.BLUE : 0xFF24456E);
+            c.drawRoundRect(box, Ui.dp(4), Ui.dp(4), p);
+            p.setStyle(Paint.Style.FILL);
             if (cl.cents != 0 && x1 - x0 > Ui.dp(50)) {
                 tp.setColor(Ui.ORANGE);
                 tp.setTextSize(Ui.dp(11));
                 tp.setTextAlign(Paint.Align.LEFT);
-                c.drawText((cl.cents > 0 ? "+" : "") + cl.cents + " ct", Math.max(x0, headerW) + Ui.dp(5), top + Ui.dp(13), tp);
+                c.drawText((cl.cents > 0 ? "+" : "") + cl.cents + " ct", Math.max(x0, headerW) + Ui.dp(8), top + Ui.dp(13), tp);
             }
+            if (isSel) handles(c, box);
         }
     }
 
-    private void drawNotes(Canvas c, Project pr) {
+    private int[] noteRange(Project pr) {
+        int lo = 127, hi = 0;
+        for (Project.MidiClip m : pr.midiClips)
+            for (Project.Note n : m.notes) { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); }
+        if (host.isRecording())
+            for (Project.Note n : host.recordingNotes()) { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); }
+        if (lo > hi) { lo = 12 * (pr.octave + 1); hi = lo + 23; }
+        lo -= 1; hi += 1;
+        while (hi - lo + 1 < 12) { lo--; hi++; }
+        return new int[]{Math.max(0, lo), Math.min(127, hi)};
+    }
+
+    private void drawMidiClips(Canvas c, Project pr) {
+        Object sel = host.selected();
         int[] rg = noteRange(pr);
-        int rows = rg[1] - rg[0] + 1;
-        float rh = keysLane.height() / rows;
-        for (Project.Note n : pr.notes) {
-            float x0 = xOf(n.start), x1 = Math.max(x0 + Ui.dp(3), xOf(n.end()));
-            if (x1 < headerW || x0 > getWidth()) continue;
-            float y = keysLane.top + (rg[1] - n.pitch) * rh;
-            r.set(Math.max(x0, headerW), y + 1, x1, y + rh - 1);
-            p.setColor(0xFF2F7CF0);
-            c.drawRoundRect(r, Ui.dp(2), Ui.dp(2), p);
-        }
-        if (pr.notes.isEmpty()) {
+        float top = keysLane.top + Ui.dp(3), bot = keysLane.bottom - Ui.dp(3);
+        float rh = (bot - top) / (rg[1] - rg[0] + 1);
+        if (pr.midiClips.isEmpty() && !host.isRecording()) {
             tp.setColor(0x55FFFFFF);
             tp.setTextSize(Ui.dp(13));
             tp.setTextAlign(Paint.Align.LEFT);
-            c.drawText("Play the keyboard while recording to add notes", headerW + Ui.dp(14), keysLane.centerY() + Ui.dp(5), tp);
+            c.drawText("Play the keyboard while recording to make a clip", headerW + Ui.dp(14), keysLane.centerY() + Ui.dp(5), tp);
+        }
+        for (Project.MidiClip m : pr.midiClips) {
+            float x0 = xOf(m.start), x1 = xOf(m.end());
+            if (x1 < headerW || x0 > getWidth()) continue;
+            boolean isSel = m == sel;
+            RectF box = new RectF(Math.max(x0, headerW - Ui.dp(4)), top, x1, bot);
+            p.setStyle(Paint.Style.FILL);
+            p.setColor(isSel ? 0xFF0F4F55 : 0xFF0B3236);
+            c.drawRoundRect(box, Ui.dp(4), Ui.dp(4), p);
+            c.save();
+            c.clipRect(box);
+            long o = m.origin();
+            p.setColor(isSel ? 0xFF7FD8FF : 0xFF2F9CF0);
+            for (Project.Note n : m.notes) {
+                long s = o + n.start, e = o + n.end();
+                if (e <= m.start || s >= m.end()) continue;
+                float nx0 = xOf(Math.max(s, m.start)), nx1 = Math.max(nx0 + Ui.dp(2), xOf(Math.min(e, m.end())));
+                float y = top + (rg[1] - n.pitch) * rh;
+                r.set(nx0, y + 1, nx1, y + Math.max(2, rh - 1));
+                c.drawRoundRect(r, Ui.dp(1.5f), Ui.dp(1.5f), p);
+            }
+            c.restore();
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(Ui.dp(isSel ? 2 : 1));
+            p.setColor(isSel ? 0xFF5BE4D0 : 0xFF1C5A60);
+            c.drawRoundRect(box, Ui.dp(4), Ui.dp(4), p);
+            p.setStyle(Paint.Style.FILL);
+            if (isSel) handles(c, box);
+        }
+    }
+
+    private void drawRecordingNotes(Canvas c, Project pr) {
+        int[] rg = noteRange(pr);
+        float top = keysLane.top + Ui.dp(3), bot = keysLane.bottom - Ui.dp(3);
+        float rh = (bot - top) / (rg[1] - rg[0] + 1);
+        p.setColor(0xFFFF8A8E);
+        long now = host.playhead();
+        for (Project.Note n : host.recordingNotes()) {
+            float nx0 = xOf(n.start);
+            float nx1 = Math.max(nx0 + Ui.dp(2), xOf(n.len > 0 ? n.end() : now));
+            float y = top + (rg[1] - n.pitch) * rh;
+            r.set(Math.max(nx0, headerW), y + 1, nx1, y + Math.max(2, rh - 1));
+            c.drawRoundRect(r, Ui.dp(1.5f), Ui.dp(1.5f), p);
         }
     }
 
@@ -316,7 +370,6 @@ public class TimelineView extends View {
         p.setColor(Ui.BG);
         c.drawRect(0, 0, headerW, getHeight(), p);
         tp.setTextAlign(Paint.Align.LEFT);
-        // ruler corner: position readout
         long ph = host.playhead();
         long beat = pr.beatLen();
         long b = ph / beat;
@@ -362,7 +415,6 @@ public class TimelineView extends View {
             tp.setTextAlign(Paint.Align.CENTER);
             c.drawText("M", muteBtn[t].centerX(), muteBtn[t].centerY() + Ui.dp(4), tp);
             tp.setTextAlign(Paint.Align.LEFT);
-            // volume bar
             float vy = by + bs + Ui.dp(14);
             if (vy < L.bottom - Ui.dp(4)) {
                 volBar[t].set(x, vy - Ui.dp(10), headerW - Ui.dp(18), vy + Ui.dp(10));
@@ -381,50 +433,47 @@ public class TimelineView extends View {
         }
     }
 
-    // ---------------------------------------------------------------- touch
+    // ---------------------------------------------------------------- hit testing
 
-    private final Runnable longPress = () -> {
-        if (mode != PENDING || host == null) return;
-        mode = NONE;
-        if (host.isRecording()) return;
-        if (vocalLane.contains(downX, downY)) {
-            Project.Clip cl = clipAt(downX);
-            if (cl != null) {
-                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                host.deleteClip(cl);
-            }
-        } else if (keysLane.contains(downX, downY)) {
-            Project.Note n = noteAt(downX, downY);
-            if (n != null) {
-                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                host.deleteNote(n);
-            }
-        }
-        invalidate();
-    };
-
-    private Project.Clip clipAt(float x) {
+    private Object clipAt(float x, float y) {
         long s = sampleAt(x);
-        Project.Clip found = null;
-        for (Project.Clip c : host.project().clips) if (s >= c.start && s < c.end()) found = c; // topmost = last
+        Project pr = host.project();
+        Object found = null;
+        if (vocalLane.contains(x, y)) {
+            for (Project.Clip c : pr.clips) if (s >= c.start && s < c.end()) found = c; // topmost = last
+        } else if (keysLane.contains(x, y)) {
+            for (Project.MidiClip m : pr.midiClips) if (s >= m.start && s < m.end()) found = m;
+        }
         return found;
     }
 
-    private Project.Note noteAt(float x, float y) {
-        Project pr = host.project();
-        int[] rg = noteRange(pr);
-        int rows = rg[1] - rg[0] + 1;
-        float rh = keysLane.height() / rows;
-        long s = sampleAt(x);
-        long tol = (long) (Ui.dp(6) * spp);
-        Project.Note best = null;
-        for (Project.Note n : pr.notes) {
-            float y0 = keysLane.top + (rg[1] - n.pitch) * rh;
-            if (y < y0 - Ui.dp(4) || y > y0 + rh + Ui.dp(4)) continue;
-            if (s >= n.start - tol && s <= n.end() + tol) best = n;
-        }
-        return best;
+    private long startOf(Object o) { return o instanceof Project.Clip ? ((Project.Clip) o).start : ((Project.MidiClip) o).start; }
+    private long endOf(Object o) { return o instanceof Project.Clip ? ((Project.Clip) o).end() : ((Project.MidiClip) o).end(); }
+
+    /** If (x,y) is on an edge of the selected clip, which one. */
+    private int edgeAt(float x, float y) {
+        Object sel = host.selected();
+        if (sel == null) return NONE;
+        RectF lane = sel instanceof Project.Clip ? vocalLane : keysLane;
+        if (!lane.contains(x, y) && !(x >= lane.left - Ui.dp(20) && y >= lane.top && y <= lane.bottom)) return NONE;
+        float x0 = xOf(startOf(sel)), x1 = xOf(endOf(sel));
+        float grab = Math.min(Ui.dp(18), (x1 - x0) / 3);
+        if (Math.abs(x - x1) <= grab) return TRIM_R;
+        if (x0 >= headerW && Math.abs(x - x0) <= grab) return TRIM_L;
+        return NONE;
     }
+
+    // ---------------------------------------------------------------- touch
+
+    private final Runnable longPress = () -> {
+        if (mode != PENDING || host == null || touchClip == null) return;
+        mode = NONE;
+        if (host.isRecording()) return;
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        host.select(touchClip);
+        invalidate();
+        host.clipMenu(touchClip);
+    };
 
     @Override
     public boolean onTouchEvent(MotionEvent e) {
@@ -432,7 +481,8 @@ public class TimelineView extends View {
         scaler.onTouchEvent(e);
         int a = e.getActionMasked();
         if (a == MotionEvent.ACTION_DOWN) scaling = false;
-        if (scaling || e.getPointerCount() > 1) {
+        if (scaling || (e.getPointerCount() > 1 && mode != MOVE && mode != TRIM_L && mode != TRIM_R)) {
+            handler.removeCallbacks(longPress);
             if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) { scaling = false; mode = NONE; }
             return true;
         }
@@ -442,7 +492,8 @@ public class TimelineView extends View {
                 getParent().requestDisallowInterceptTouchEvent(true);
                 downX = x; downY = y; downView = viewStart;
                 mode = NONE;
-                if (x < headerW) {
+                touchClip = null;
+                if (x < headerW && y > rulerH) {
                     for (int t = 0; t < 2; t++) {
                         if (expand(armBtn[t]).contains(x, y)) { host.toggleArm(t); invalidate(); return true; }
                         if (expand(muteBtn[t]).contains(x, y)) { host.toggleMute(t); invalidate(); return true; }
@@ -454,67 +505,116 @@ public class TimelineView extends View {
                     }
                     return true;
                 }
-                if (y < rulerH) {
-                    mode = SEEK;
-                    host.seek(sampleAt(x));
-                    invalidate();
-                    return true;
-                }
+                if (y < rulerH) { mode = RULER; return true; }
+                pendingTrim = host.isRecording() ? NONE : edgeAt(x, y);
+                touchClip = pendingTrim != NONE ? host.selected() : clipAt(x, y);
                 mode = PENDING;
-                handler.postDelayed(longPress, 450);
+                if (touchClip != null) handler.postDelayed(longPress, 550);
                 return true;
             }
             case MotionEvent.ACTION_MOVE: {
                 float dx = x - downX;
                 if (mode == VOL) { setVol(x, false); return true; }
-                if (mode == SEEK) { host.seek(sampleAt(x)); invalidate(); return true; }
-                if (mode == PENDING && (Math.abs(dx) > slop || Math.abs(y - downY) > slop)) {
+                boolean moved = Math.abs(dx) > slop || Math.abs(y - downY) > slop;
+                if (mode == RULER && moved) mode = SCROLL;
+                if (mode == PENDING && moved) {
                     handler.removeCallbacks(longPress);
-                    Project.Clip sel = host.selected();
-                    if (sel != null && vocalLane.contains(downX, downY) && clipAt(downX) == sel
-                            && !host.isRecording() && !host.isPlaying()) {
+                    if (touchClip != null && !host.isRecording()) {
                         host.beginEdit();
-                        dragClip = sel;
-                        clipOrigStart = sel.start;
-                        mode = MOVE_CLIP;
+                        host.select(touchClip);
+                        rememberOriginal(touchClip);
+                        mode = pendingTrim != NONE ? pendingTrim : MOVE;
                     } else {
                         mode = SCROLL;
                     }
                 }
                 if (mode == SCROLL) {
                     viewStart = Math.max(0, downView - dx * spp);
-                    invalidate();
-                } else if (mode == MOVE_CLIP && dragClip != null) {
-                    long ns = Math.max(0, clipOrigStart + Math.round(dx * spp));
-                    long beat = host.project().beatLen();
-                    long snap = Math.round(ns / (double) beat) * beat;
-                    if (Math.abs(snap - ns) < Ui.dp(8) * spp) ns = snap; // magnet to beats
-                    dragClip.start = ns;
-                    invalidate();
+                } else if (mode == MOVE) {
+                    dragMove(dx);
+                } else if (mode == TRIM_L || mode == TRIM_R) {
+                    dragTrim(x);
                 }
+                invalidate();
                 return true;
             }
             case MotionEvent.ACTION_UP: {
                 handler.removeCallbacks(longPress);
                 if (mode == VOL) setVol(x, true);
-                else if (mode == MOVE_CLIP) { dragClip = null; host.clipMoved(); }
+                else if (mode == MOVE || mode == TRIM_L || mode == TRIM_R) host.clipsChanged();
+                else if (mode == RULER) host.seek(sampleAt(x));
                 else if (mode == PENDING) {
-                    // tap: select clip under finger and move the cursor here
-                    if (vocalLane.contains(x, y)) host.select(clipAt(x));
-                    else host.select(null);
+                    host.select(touchClip);
                     host.seek(sampleAt(x));
                 }
                 mode = NONE;
+                touchClip = null;
                 invalidate();
                 return true;
             }
             case MotionEvent.ACTION_CANCEL:
                 handler.removeCallbacks(longPress);
-                if (mode == MOVE_CLIP) { dragClip = null; host.clipMoved(); }
+                if (mode == MOVE || mode == TRIM_L || mode == TRIM_R) host.clipsChanged();
                 mode = NONE;
+                touchClip = null;
                 return true;
         }
         return true;
+    }
+
+    private void rememberOriginal(Object o) {
+        if (o instanceof Project.Clip) {
+            Project.Clip c = (Project.Clip) o;
+            origStart = c.start; origLen = c.len; origSrcStart = c.srcStart; origOffset = 0;
+        } else {
+            Project.MidiClip m = (Project.MidiClip) o;
+            origStart = m.start; origLen = m.len; origOffset = m.offset; origSrcStart = 0;
+        }
+    }
+
+    /** Moves by whole grid steps, so a clip that sat on the grid stays on it. */
+    private void dragMove(float dx) {
+        long g = gridStep();
+        long delta = Math.round(dx * spp / g) * g;
+        long ns = Math.max(0, origStart + delta);
+        if (touchClip instanceof Project.Clip) ((Project.Clip) touchClip).start = ns;
+        else ((Project.MidiClip) touchClip).start = ns;
+    }
+
+    /** Drags an edge; the edge lands on the grid. */
+    private void dragTrim(float x) {
+        long pos = snap(sampleAt(x));
+        long minLen = Math.max(SR / 20, gridStep());
+        long origEnd = origStart + origLen;
+        if (touchClip instanceof Project.Clip) {
+            Project.Clip c = (Project.Clip) touchClip;
+            int srcLen = host.sourceLength(c.src);
+            if (mode == TRIM_L) {
+                long earliest = origStart - origSrcStart;            // can't go before the recording began
+                long ns = Math.max(earliest, Math.min(pos, origEnd - minLen));
+                long d = ns - origStart;
+                c.start = ns;
+                c.srcStart = (int) (origSrcStart + d);
+                c.len = (int) (origLen - d);
+            } else {
+                long latest = origStart + (srcLen - origSrcStart);   // can't go past the recording's end
+                long ne = Math.min(latest, Math.max(pos, origStart + minLen));
+                c.len = (int) (ne - origStart);
+            }
+        } else {
+            Project.MidiClip m = (Project.MidiClip) touchClip;
+            if (mode == TRIM_L) {
+                long earliest = Math.max(0, origStart - origOffset); // can't go before the clip's content began
+                long ns = Math.max(earliest, Math.min(pos, origEnd - minLen));
+                long d = ns - origStart;
+                m.start = ns;
+                m.offset = origOffset + d;
+                m.len = origLen - d;
+            } else {
+                long ne = Math.max(pos, origStart + minLen);         // MIDI clips can be stretched longer
+                m.len = ne - origStart;
+            }
+        }
     }
 
     private RectF expand(RectF a) {

@@ -36,7 +36,7 @@ public class Project {
     public int chordKey = 0, chordScale = 0, chordShape = 0, chordNotes = 3, chordInv = 0;
 
     public List<Clip> clips = new ArrayList<>();
-    public List<Note> notes = new ArrayList<>();
+    public List<MidiClip> midiClips = new ArrayList<>();
 
     public static class Clip {
         public String src;   // name of the recorded audio file
@@ -67,21 +67,98 @@ public class Project {
         public long end() { return start + len; }
     }
 
-    public long beatLen() { return Math.round(SR * 60.0 / tempo); }
+    /**
+     * A clip on the keyboard track. Note times are relative to the clip's content;
+     * 'offset' is how much of the content is trimmed off the left edge.
+     */
+    public static class MidiClip {
+        public long start, len, offset;
+        public List<Note> notes = new ArrayList<>();
 
-    /** End of the last clip or note. */
+        public long end() { return start + len; }
+        /** Timeline position of content time 0. */
+        public long origin() { return start - offset; }
+
+        public MidiClip copy() {
+            MidiClip m = new MidiClip();
+            m.start = start; m.len = len; m.offset = offset;
+            for (Note n : notes) m.notes.add(n.copy());
+            return m;
+        }
+
+        /** Notes as they sound on the timeline: cut at the clip edges. */
+        public void addAudible(List<Note> out) {
+            long o = origin(), e = end();
+            for (Note n : notes) {
+                long s = o + n.start;
+                if (s < start || s >= e) continue;
+                Note x = new Note();
+                x.pitch = n.pitch; x.vel = n.vel; x.start = s;
+                x.len = Math.max(1, Math.min(o + n.end(), e) - s);
+                out.add(x);
+            }
+        }
+    }
+
+    public long beatLen() { return Math.round(SR * 60.0 / tempo); }
+    public long barLen() { return beatLen() * 4; }
+
+    /** Every keyboard note that will sound, sorted by time. */
+    public List<Note> flatNotes() {
+        List<Note> out = new ArrayList<>();
+        for (MidiClip m : midiClips) m.addAudible(out);
+        Collections.sort(out, (a, b) -> Long.compare(a.start, b.start));
+        return out;
+    }
+
+    public int noteCount() {
+        int n = 0;
+        for (MidiClip m : midiClips) n += m.notes.size();
+        return n;
+    }
+
+    /** End of the last clip. */
     public long contentEnd() {
         long e = 0;
         for (Clip c : clips) e = Math.max(e, c.end());
-        for (Note n : notes) e = Math.max(e, n.end());
+        for (MidiClip m : midiClips) e = Math.max(e, m.end());
         return e;
     }
 
-    public void sortNotes() {
-        Collections.sort(notes, (a, b) -> Long.compare(a.start, b.start));
+    /** Wraps loose notes (older projects) into one clip that covers whole bars. */
+    public static MidiClip clipFromNotes(List<Note> abs, long bar) {
+        MidiClip m = new MidiClip();
+        long first = Long.MAX_VALUE, last = 0;
+        for (Note n : abs) { first = Math.min(first, n.start); last = Math.max(last, n.end()); }
+        long s = (first / bar) * bar;
+        long e = Math.max(s + bar, ((last + bar - 1) / bar) * bar);
+        m.start = s; m.len = e - s; m.offset = 0;
+        for (Note n : abs) { Note x = n.copy(); x.start -= s; m.notes.add(x); }
+        return m;
     }
 
     // ---------- JSON ----------
+
+    private static JSONArray notesToJson(List<Note> list) throws JSONException {
+        JSONArray na = new JSONArray();
+        for (Note n : list) {
+            JSONObject j = new JSONObject();
+            j.put("p", n.pitch); j.put("v", n.vel); j.put("s", n.start); j.put("l", n.len);
+            na.put(j);
+        }
+        return na;
+    }
+
+    private static List<Note> notesFromJson(JSONArray na) throws JSONException {
+        List<Note> out = new ArrayList<>();
+        if (na != null) for (int i = 0; i < na.length(); i++) {
+            JSONObject j = na.getJSONObject(i);
+            Note n = new Note();
+            n.pitch = j.getInt("p"); n.vel = j.optInt("v", 100); n.start = j.getLong("s"); n.len = j.getLong("l");
+            out.add(n);
+        }
+        return out;
+    }
 
     public JSONObject editsToJson() throws JSONException {
         JSONObject o = new JSONObject();
@@ -92,20 +169,21 @@ public class Project {
             j.put("start", c.start); j.put("cents", c.cents);
             ca.put(j);
         }
-        JSONArray na = new JSONArray();
-        for (Note n : notes) {
+        JSONArray ma = new JSONArray();
+        for (MidiClip m : midiClips) {
             JSONObject j = new JSONObject();
-            j.put("p", n.pitch); j.put("v", n.vel); j.put("s", n.start); j.put("l", n.len);
-            na.put(j);
+            j.put("start", m.start); j.put("len", m.len); j.put("offset", m.offset);
+            j.put("notes", notesToJson(m.notes));
+            ma.put(j);
         }
         o.put("clips", ca);
-        o.put("notes", na);
+        o.put("midiClips", ma);
         return o;
     }
 
     public void editsFromJson(JSONObject o) throws JSONException {
         clips = new ArrayList<>();
-        notes = new ArrayList<>();
+        midiClips = new ArrayList<>();
         JSONArray ca = o.optJSONArray("clips");
         if (ca != null) for (int i = 0; i < ca.length(); i++) {
             JSONObject j = ca.getJSONObject(i);
@@ -114,14 +192,17 @@ public class Project {
             c.start = j.getLong("start"); c.cents = j.optInt("cents", 0);
             clips.add(c);
         }
-        JSONArray na = o.optJSONArray("notes");
-        if (na != null) for (int i = 0; i < na.length(); i++) {
-            JSONObject j = na.getJSONObject(i);
-            Note n = new Note();
-            n.pitch = j.getInt("p"); n.vel = j.optInt("v", 100); n.start = j.getLong("s"); n.len = j.getLong("l");
-            notes.add(n);
+        JSONArray ma = o.optJSONArray("midiClips");
+        if (ma != null) for (int i = 0; i < ma.length(); i++) {
+            JSONObject j = ma.getJSONObject(i);
+            MidiClip m = new MidiClip();
+            m.start = j.getLong("start"); m.len = j.getLong("len"); m.offset = j.optLong("offset", 0);
+            m.notes = notesFromJson(j.optJSONArray("notes"));
+            midiClips.add(m);
         }
-        sortNotes();
+        // older projects stored loose notes: turn them into one clip
+        List<Note> loose = notesFromJson(o.optJSONArray("notes"));
+        if (!loose.isEmpty()) midiClips.add(clipFromNotes(loose, barLen()));
     }
 
     public JSONObject toJson() throws JSONException {

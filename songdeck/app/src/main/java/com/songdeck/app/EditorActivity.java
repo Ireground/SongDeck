@@ -64,16 +64,15 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ArrayDeque<String> undo = new ArrayDeque<>();
     private final Map<Integer, long[]> heldNotes = new HashMap<>();
-    private Project.Clip selected;
+    private Object selected;                         // a Project.Clip or a Project.MidiClip
+    private final List<Project.Note> recNotes = new ArrayList<>(); // keyboard notes of the take being recorded
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TimelineView timeline;
     private KeyboardView keyboard;
     private TextView nameView, statusPill, metroBtn, tempoBtn, octaveLabel, recBtn, preBtn, playBtn;
     private TextView[] instBtns = new TextView[3];
-    private LinearLayout clipBox;
-    private TextView clipHint, pitchValue;
-    private Ui.Slider pitchSlider;
+    private TextView dupBtn, delBtn, pitchBtn;
 
     // ------------------------------------------------------------ setup
 
@@ -104,10 +103,6 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         tl.topMargin = Ui.dp(6);
         root.addView(timeline, tl);
 
-        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(MATCH, Ui.dp(50));
-        sl.topMargin = Ui.dp(6);
-        root.addView(buildStrip(), sl);
-
         keyboard = new KeyboardView(this);
         LinearLayout.LayoutParams kb = new LinearLayout.LayoutParams(MATCH, WRAP);
         kb.topMargin = Ui.dp(6);
@@ -122,7 +117,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
 
         setContentView(root);
         refreshButtons();
-        refreshClipBox();
+        refreshSelection();
         refreshChordUi();
 
         for (Project.Clip c : project.clips) if (c.cents != 0) schedulePitch(c);
@@ -171,6 +166,12 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         bar.addView(tempoBtn);
         bar.addView(Ui.pill(this, "Split at cursor", Ui.GREEN, v -> split()));
         bar.addView(Ui.pill(this, "↶ Undo", Ui.GREY, v -> undo()));
+        dupBtn = Ui.pill(this, "Duplicate", Ui.GREY, v -> duplicate());
+        bar.addView(dupBtn);
+        pitchBtn = Ui.pill(this, "Pitch", Ui.GREY, v -> { if (selected instanceof Project.Clip) pitchDialog((Project.Clip) selected); });
+        bar.addView(pitchBtn);
+        delBtn = Ui.pill(this, "Delete", Ui.GREY, v -> deleteSelected());
+        bar.addView(delBtn);
 
         statusPill = Ui.label(this, "", 11, 0xFF000000, true);
         statusPill.setPadding(Ui.dp(12), Ui.dp(5), Ui.dp(12), Ui.dp(5));
@@ -194,49 +195,6 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(WRAP, WRAP);
         lp.leftMargin = Ui.dp(leftMarginDp);
         bar.addView(v, lp);
-    }
-
-    private View buildStrip() {
-        LinearLayout strip = new LinearLayout(this);
-        strip.setGravity(Gravity.CENTER_VERTICAL);
-        strip.setBackground(Ui.round(Ui.PANEL, 12));
-        strip.setPadding(Ui.dp(12), 0, Ui.dp(8), 0);
-
-        // clip section
-        LinearLayout left = new LinearLayout(this);
-        left.setGravity(Gravity.CENTER_VERTICAL);
-        strip.addView(left, new LinearLayout.LayoutParams(0, MATCH, 1));
-
-        clipHint = Ui.label(this, "Tap a vocal clip to change its pitch  •  Hold a clip or note to delete it  •  Pinch to zoom", 12, Ui.DIM, false);
-        clipHint.setSingleLine(true);
-        clipHint.setEllipsize(TextUtils.TruncateAt.END);
-        left.addView(clipHint, new LinearLayout.LayoutParams(MATCH, WRAP));
-
-        clipBox = new LinearLayout(this);
-        clipBox.setGravity(Gravity.CENTER_VERTICAL);
-        left.addView(clipBox, new LinearLayout.LayoutParams(MATCH, MATCH));
-        clipBox.addView(Ui.label(this, "CLIP PITCH", 11, Ui.DIM, true));
-        pitchSlider = new Ui.Slider(this, -100, 100, 0, 0);
-        LinearLayout.LayoutParams psl = new LinearLayout.LayoutParams(0, MATCH, 1);
-        psl.leftMargin = Ui.dp(8);
-        clipBox.addView(pitchSlider, psl);
-        pitchValue = Ui.label(this, "0 ct", 14, Ui.TEXT, true);
-        pitchValue.setMinWidth(Ui.dp(64));
-        pitchValue.setGravity(Gravity.CENTER);
-        clipBox.addView(pitchValue);
-        pitchSlider.setListener((v, done) -> {
-            int cents = Math.round(v);
-            pitchValue.setText(centsText(cents));
-            if (done) setCents(cents);
-        });
-        TextView reset = Ui.pill(this, "0", Ui.GREY, v -> { pitchSlider.setValue(0); pitchValue.setText(centsText(0)); setCents(0); });
-        clipBox.addView(reset);
-        TextView del = Ui.pill(this, "Delete", 0xFF6B2226, v -> { if (selected != null) deleteClip(selected); });
-        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(WRAP, WRAP);
-        dl.leftMargin = Ui.dp(6);
-        clipBox.addView(del, dl);
-
-        return strip;
     }
 
     /** Row above the keyboard: sounds, octave, quantize and the one-finger chord controls. */
@@ -459,10 +417,10 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
             cps.add(cp);
         }
         s.clips = cps.toArray(new Mixer.ClipPlay[0]);
-        project.sortNotes();
-        Mixer.NotePlay[] ns = new Mixer.NotePlay[project.notes.size()];
+        List<Project.Note> flat = project.flatNotes();
+        Mixer.NotePlay[] ns = new Mixer.NotePlay[flat.size()];
         for (int i = 0; i < ns.length; i++) {
-            Project.Note n = project.notes.get(i);
+            Project.Note n = flat.get(i);
             Mixer.NotePlay np = new Mixer.NotePlay();
             np.pitch = n.pitch; np.vel = n.vel; np.start = n.start; np.end = n.end();
             ns[i] = np;
@@ -493,7 +451,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
                     pitchPending.remove(key);
                     pitchCache.put(key, out);
                     pushState();
-                    refreshClipBox();
+                    refreshSelection();
                 });
             });
         } catch (Exception ignored) { pitchPending.remove(key); }
@@ -544,7 +502,8 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         }
         beginEdit();
         selected = null;
-        refreshClipBox();
+        refreshSelection();
+        recNotes.clear();
         recording = true;
         recordStart = project.cursor;
         heldNotes.clear();
@@ -572,6 +531,20 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         // keyboard notes still held
         for (Map.Entry<Integer, long[]> e : heldNotes.entrySet()) addRecordedNote(e.getKey(), e.getValue(), notePos(now));
         heldNotes.clear();
+        // the keyboard take becomes one clip, from where recording started, rounded up to whole bars
+        if (!recNotes.isEmpty()) {
+            long bar = project.barLen();
+            long start = Math.min(recordStart, recNotes.get(0).start);
+            long last = 0;
+            for (Project.Note n : recNotes) last = Math.max(last, n.end());
+            long len = Math.max(bar, ((last - start + bar - 1) / bar) * bar);
+            Project.MidiClip mc = new Project.MidiClip();
+            mc.start = start; mc.len = len; mc.offset = 0;
+            for (Project.Note n : recNotes) { Project.Note x = n.copy(); x.start -= start; mc.notes.add(x); }
+            project.midiClips.add(mc);
+            selected = mc;
+            recNotes.clear();
+        }
 
         Recorder r = recorder;
         recorder = null;
@@ -600,7 +573,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         project.cursor = to;
         engine.post(() -> engine.mixer.seek(to));
         pushState();
-        refreshClipBox();
+        refreshSelection();
         save();
         timeline.invalidate();
     }
@@ -686,8 +659,8 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         Project.Note n = new Project.Note();
         n.pitch = note; n.vel = (int) h[1]; n.start = h[0];
         n.len = Math.max(SR / 40, end - h[0]);
-        project.notes.add(n);
-        project.sortNotes();
+        recNotes.add(n);
+        java.util.Collections.sort(recNotes, (x, y) -> Long.compare(x.start, y.start));
         timeline.invalidate();
     }
 
@@ -717,72 +690,185 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         selected = null;
         for (Project.Clip c : project.clips) { loadSource(c.src); if (c.cents != 0) schedulePitch(c); }
         pushState();
-        refreshClipBox();
+        refreshSelection();
         timeline.invalidate();
     }
 
     private void split() {
         if (recording) return;
         long cut = engine.mixer.playing ? engine.mixer.pos : project.cursor;
-        Project.Clip target = null;
-        if (selected != null && cut > selected.start && cut < selected.end()) target = selected;
-        else for (Project.Clip c : project.clips) if (cut > c.start + SR / 50 && cut < c.end() - SR / 50) target = c;
-        if (target == null) { toast("Put the cursor over a vocal clip to split it"); return; }
+        long edge = SR / 50;
+        Object target = null;
+        if (selected instanceof Project.Clip) {
+            Project.Clip c = (Project.Clip) selected;
+            if (cut > c.start + edge && cut < c.end() - edge) target = c;
+        } else if (selected instanceof Project.MidiClip) {
+            Project.MidiClip m = (Project.MidiClip) selected;
+            if (cut > m.start + edge && cut < m.end() - edge) target = m;
+        }
+        if (target == null) for (Project.Clip c : project.clips) if (cut > c.start + edge && cut < c.end() - edge) target = c;
+        if (target == null) for (Project.MidiClip m : project.midiClips) if (cut > m.start + edge && cut < m.end() - edge) target = m;
+        if (target == null) { toast("Put the cursor over a clip to split it"); return; }
         beginEdit();
-        int off = (int) (cut - target.start);
-        Project.Clip b = target.copy();
-        b.srcStart += off; b.len -= off; b.start = cut;
-        target.len = off;
-        project.clips.add(project.clips.indexOf(target) + 1, b);
-        selected = b;
-        schedulePitch(target);
-        schedulePitch(b);
+        if (target instanceof Project.Clip) {
+            Project.Clip a = (Project.Clip) target;
+            int off = (int) (cut - a.start);
+            Project.Clip b = a.copy();
+            b.srcStart += off; b.len -= off; b.start = cut;
+            a.len = off;
+            project.clips.add(project.clips.indexOf(a) + 1, b);
+            selected = b;
+            schedulePitch(a);
+            schedulePitch(b);
+        } else {
+            Project.MidiClip a = (Project.MidiClip) target;
+            long off = cut - a.start;
+            Project.MidiClip b = a.copy();
+            b.start = cut; b.offset = a.offset + off; b.len = a.len - off;
+            a.len = off;
+            project.midiClips.add(project.midiClips.indexOf(a) + 1, b);
+            selected = b;
+        }
         pushState();
-        refreshClipBox();
+        refreshSelection();
         timeline.invalidate();
     }
 
+    /** Copies the selected clip and puts the copy right after it (like Ctrl/Cmd-D in Reaper). */
+    private void duplicate() {
+        if (recording) return;
+        if (selected == null) { toast("Tap a clip first, then Duplicate"); return; }
+        beginEdit();
+        if (selected instanceof Project.Clip) {
+            Project.Clip a = (Project.Clip) selected;
+            Project.Clip b = a.copy();
+            b.start = a.end();
+            project.clips.add(b);
+            selected = b;
+        } else {
+            Project.MidiClip a = (Project.MidiClip) selected;
+            Project.MidiClip b = a.copy();
+            b.start = a.end();
+            project.midiClips.add(b);
+            selected = b;
+        }
+        pushState();
+        refreshSelection();
+        timeline.invalidate();
+    }
+
+    private void deleteSelected() {
+        if (recording) return;
+        if (selected == null) { toast("Tap a clip first"); return; }
+        beginEdit();
+        project.clips.remove(selected);
+        project.midiClips.remove(selected);
+        selected = null;
+        pushState();
+        refreshSelection();
+        timeline.invalidate();
+        toast("Clip deleted — Undo brings it back");
+    }
+
+    /** Snaps notes to 1/16: the selected keyboard clip, or all of them if none is selected. */
     private void quantize() {
         if (recording) return;
-        if (project.notes.isEmpty()) { toast("No keyboard notes to quantize"); return; }
+        List<Project.MidiClip> targets = new ArrayList<>();
+        if (selected instanceof Project.MidiClip) targets.add((Project.MidiClip) selected);
+        else targets.addAll(project.midiClips);
+        int count = 0;
+        for (Project.MidiClip m : targets) count += m.notes.size();
+        if (count == 0) { toast("No keyboard notes to quantize"); return; }
         beginEdit();
-        long grid = project.beatLen() / 4; // 1/16 notes
-        for (Project.Note n : project.notes) {
-            long s = Math.round(n.start / (double) grid) * grid;
-            long e = Math.round(n.end() / (double) grid) * grid;
-            if (e <= s) e = s + grid;
-            n.start = s;
-            n.len = e - s;
+        long grid = project.beatLen() / 4;
+        for (Project.MidiClip m : targets) {
+            long o = m.origin();
+            for (Project.Note n : m.notes) {
+                long s = Math.round((o + n.start) / (double) grid) * grid;
+                long e = Math.round((o + n.end()) / (double) grid) * grid;
+                if (e <= s) e = s + grid;
+                n.start = s - o;
+                n.len = e - s;
+            }
         }
-        project.sortNotes();
         pushState();
         timeline.invalidate();
-        toast("Notes snapped to 1/16 — Undo to go back");
+        toast(targets.size() == 1 ? "Clip snapped to 1/16 — Undo to go back" : "All keyboard clips snapped to 1/16 — Undo to go back");
     }
 
-    private void setCents(int cents) {
-        if (selected == null || selected.cents == cents) return;
+    private void setCents(Project.Clip c, int cents) {
+        if (c == null || c.cents == cents) return;
         beginEdit();
-        selected.cents = cents;
-        schedulePitch(selected);
+        c.cents = cents;
+        schedulePitch(c);
         pushState();
-        refreshClipBox();
+        refreshSelection();
         timeline.invalidate();
     }
 
     private static String centsText(int c) { return (c > 0 ? "+" : "") + c + " ct"; }
 
-    private void refreshClipBox() {
-        if (clipBox == null) return;
-        boolean has = selected != null && project.clips.contains(selected);
-        if (!has) selected = null;
-        clipBox.setVisibility(has ? View.VISIBLE : View.GONE);
-        clipHint.setVisibility(has ? View.GONE : View.VISIBLE);
-        if (has) {
-            pitchSlider.setValue(selected.cents);
-            boolean busy = selected.cents != 0 && !pitchCache.containsKey(selected.cacheKey());
-            pitchValue.setText(busy ? "…" : centsText(selected.cents));
+    /** Pitch window for a vocal clip: -100..+100 cents. */
+    private void pitchDialog(Project.Clip c) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(22), Ui.dp(10), Ui.dp(22), Ui.dp(4));
+        TextView val = Ui.label(this, centsText(c.cents), 22, Ui.TEXT, true);
+        val.setGravity(Gravity.CENTER);
+        box.addView(val, new LinearLayout.LayoutParams(MATCH, WRAP));
+        Ui.Slider sl = new Ui.Slider(this, -100, 100, c.cents, 0);
+        sl.setListener((v, done) -> val.setText(centsText(Math.round(v))));
+        box.addView(sl, new LinearLayout.LayoutParams(MATCH, Ui.dp(48)));
+        TextView tip = Ui.label(this, "-100 to +100 cents (100 cents = 1 semitone). Double-tap the slider for 0.", 12, Ui.DIM, false);
+        box.addView(tip);
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Clip pitch")
+                .setView(box)
+                .setPositiveButton("OK", (d, w) -> setCents(c, Math.round(sl.getValue())))
+                .setNeutralButton("Reset to 0", (d, w) -> setCents(c, 0))
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Pop-up when holding a finger on a clip. */
+    private void showClipMenu(Object clip) {
+        boolean vocal = clip instanceof Project.Clip;
+        String[] items = vocal
+                ? new String[]{"Delete clip", "Duplicate", "Change pitch…"}
+                : new String[]{"Delete clip", "Duplicate", "Quantize notes to 1/16"};
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle(vocal ? "Vocal clip" : "Keyboard clip")
+                .setItems(items, (d, w) -> {
+                    selected = clip;
+                    if (w == 0) deleteSelected();
+                    else if (w == 1) duplicate();
+                    else if (vocal) pitchDialog((Project.Clip) clip);
+                    else quantize();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void refreshSelection() {
+        if (dupBtn == null) return;
+        if (selected != null && !project.clips.contains(selected) && !project.midiClips.contains(selected)) selected = null;
+        boolean has = selected != null;
+        boolean vocal = selected instanceof Project.Clip;
+        Ui.setPillColor(dupBtn, has ? Ui.BLUE : Ui.GREY);
+        dupBtn.setAlpha(has ? 1f : 0.45f);
+        Ui.setPillColor(delBtn, has ? 0xFF9B1C22 : Ui.GREY);
+        delBtn.setAlpha(has ? 1f : 0.45f);
+        pitchBtn.setAlpha(vocal ? 1f : 0.45f);
+        if (vocal) {
+            Project.Clip c = (Project.Clip) selected;
+            boolean busy = c.cents != 0 && !pitchCache.containsKey(c.cacheKey());
+            pitchBtn.setText(busy ? "Pitch …" : "Pitch " + centsText(c.cents));
+            Ui.setPillColor(pitchBtn, Ui.BLUE);
+        } else {
+            pitchBtn.setText("Pitch");
+            Ui.setPillColor(pitchBtn, Ui.GREY);
         }
+        if (timeline != null) timeline.invalidate();
     }
 
     private void refreshButtons() {
@@ -873,7 +959,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
             "Keyboard Track only (MIDI .mid)"};
 
     private boolean canRender(int kind) {
-        if (kind == KIND_MIDI && project.notes.isEmpty()) { toast("No keyboard notes yet"); return false; }
+        if (kind == KIND_MIDI && project.flatNotes().isEmpty()) { toast("No keyboard notes yet"); return false; }
         if (kind == KIND_VOCAL && project.clips.isEmpty()) { toast("No vocal recorded yet"); return false; }
         if (kind == KIND_MIX && project.contentEnd() == 0) { toast("Nothing recorded yet"); return false; }
         return true;
@@ -968,8 +1054,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         p.vocalVol = project.vocalVol; p.keysVol = project.keysVol;
         p.vocalMute = project.vocalMute; p.keysMute = project.keysMute;
         for (Project.Clip c : project.clips) p.clips.add(c.copy());
-        for (Project.Note n : project.notes) p.notes.add(n.copy());
-        p.sortNotes();
+        for (Project.MidiClip m : project.midiClips) p.midiClips.add(m.copy());
         return p;
     }
 
@@ -988,9 +1073,10 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
             cps.add(cp);
         }
         s.clips = cps.toArray(new Mixer.ClipPlay[0]);
-        Mixer.NotePlay[] ns = new Mixer.NotePlay[p.notes.size()];
+        List<Project.Note> flat = p.flatNotes();
+        Mixer.NotePlay[] ns = new Mixer.NotePlay[flat.size()];
         for (int i = 0; i < ns.length; i++) {
-            Project.Note n = p.notes.get(i);
+            Project.Note n = flat.get(i);
             Mixer.NotePlay np = new Mixer.NotePlay();
             np.pitch = n.pitch; np.vel = n.vel; np.start = n.start; np.end = n.end();
             ns[i] = np;
@@ -1042,13 +1128,20 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
     @Override public boolean isRecording() { return recording; }
     @Override public long recordStart() { return recordStart; }
     @Override public float[] peaks(String src) { return peaks.get(src); }
-    @Override public Project.Clip selected() { return selected; }
+    @Override public Object selected() { return selected; }
+    @Override public List<Project.Note> recordingNotes() { return recNotes; }
 
     @Override
-    public void select(Project.Clip c) {
+    public int sourceLength(String src) {
+        short[] d = audio.get(src);
+        return d == null ? 0 : d.length;
+    }
+
+    @Override
+    public void select(Object c) {
         if (recording) return;
         selected = c;
-        refreshClipBox();
+        refreshSelection();
     }
 
     @Override
@@ -1060,28 +1153,14 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
     }
 
     @Override
-    public void deleteClip(Project.Clip c) {
-        if (recording) return;
-        beginEdit();
-        project.clips.remove(c);
-        if (selected == c) selected = null;
+    public void clipsChanged() {
+        if (selected instanceof Project.Clip) schedulePitch((Project.Clip) selected); // trimming changes the audio
         pushState();
-        refreshClipBox();
-        timeline.invalidate();
-        toast("Clip deleted — Undo brings it back");
+        refreshSelection();
     }
 
     @Override
-    public void deleteNote(Project.Note n) {
-        if (recording) return;
-        beginEdit();
-        project.notes.remove(n);
-        pushState();
-        timeline.invalidate();
-    }
-
-    @Override
-    public void clipMoved() { pushState(); }
+    public void clipMenu(Object clip) { showClipMenu(clip); }
 
     @Override
     public void toggleArm(int track) {
