@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Each GitHub build gets a higher version number so it installs over the previous one.
+def runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+
+android {
+    namespace 'com.songdeck.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.songdeck.app"
+        minSdk 26
+        targetSdk 34
+        versionCode runNumber
+        versionName "1.0.${runNumber}"
+    }
+
+    // A fixed signing key, so every new build can update the installed app.
+    signingConfigs {
+        fixed {
+            storeFile file("songdeck.keystore")
+            storePassword "songdeck"
+            keyAlias "songdeck"
+            keyPassword "songdeck"
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.fixed
+        }
+        release {
+            signingConfig signingConfigs.fixed
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

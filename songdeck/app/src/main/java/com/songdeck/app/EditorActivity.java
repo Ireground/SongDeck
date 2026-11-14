@@ -1,0 +1,962 @@
+package com.songdeck.app;
+
+import android.Manifest;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.ProgressDialog;
+import android.content.ClipData;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.media.AudioManager;
+import android.net.Uri;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.TextUtils;
+import android.text.style.RelativeSizeSpan;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.HorizontalScrollView;
+import android.widget.LinearLayout;
+import android.widget.NumberPicker;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStream;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/** The recording screen from the mock-up. */
+public class EditorActivity extends Activity implements TimelineView.Host, KeyboardView.Listener {
+
+    private static final int SR = Project.SR;
+    private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+    private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
+    private static final int REQ_MIC = 1, REQ_WAV = 10, REQ_MIDI = 11;
+
+    private Store store;
+    private Project project;
+    private final Engine engine = new Engine();
+    private Recorder recorder;
+    private boolean recording;
+    private long recordStart;
+
+    private final Map<String, short[]> audio = new HashMap<>();
+    private final Map<String, float[]> peaks = new HashMap<>();
+    private final Map<String, float[]> pitchCache = new HashMap<>();
+    private final Set<String> pitchPending = new HashSet<>();
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ArrayDeque<String> undo = new ArrayDeque<>();
+    private final Map<Integer, long[]> heldNotes = new HashMap<>();
+    private Project.Clip selected;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private TimelineView timeline;
+    private KeyboardView keyboard;
+    private TextView nameView, statusPill, metroBtn, tempoBtn, octaveLabel, recBtn, preBtn, playBtn;
+    private TextView[] instBtns = new TextView[3];
+    private LinearLayout clipBox;
+    private TextView clipHint, pitchValue;
+    private Ui.Slider pitchSlider;
+
+    // ------------------------------------------------------------ setup
+
+    @Override
+    protected void onCreate(Bundle b) {
+        super.onCreate(b);
+        Ui.init(this);
+        store = new Store(this);
+        project = store.loadProject(getIntent().getStringExtra("id"));
+        if (project == null) { finish(); return; }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        getWindow().setStatusBarColor(Ui.BG);
+        getWindow().setNavigationBarColor(Ui.BG);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
+
+        for (Project.Clip c : project.clips) loadSource(c.src);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Ui.BG);
+        root.setPadding(Ui.dp(8), Ui.dp(6), Ui.dp(8), Ui.dp(6));
+
+        root.addView(buildToolbar(), new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        timeline = new TimelineView(this);
+        timeline.setHost(this);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(MATCH, 0, 1.15f);
+        tl.topMargin = Ui.dp(6);
+        root.addView(timeline, tl);
+
+        LinearLayout.LayoutParams sl = new LinearLayout.LayoutParams(MATCH, Ui.dp(50));
+        sl.topMargin = Ui.dp(6);
+        root.addView(buildStrip(), sl);
+
+        keyboard = new KeyboardView(this);
+        keyboard.setListener(this);
+        keyboard.setBaseNote(12 * (project.octave + 1));
+        LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        kl.topMargin = Ui.dp(6);
+        root.addView(keyboard, kl);
+
+        setContentView(root);
+        refreshButtons();
+        refreshClipBox();
+
+        for (Project.Clip c : project.clips) if (c.cents != 0) schedulePitch(c);
+        pushState();
+        engine.post(() -> engine.mixer.seek(project.cursor));
+
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+        }
+    }
+
+    private View buildToolbar() {
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setFillViewport(true);
+        LinearLayout bar = new LinearLayout(this);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        hs.addView(bar, new ViewGroup.LayoutParams(MATCH, WRAP));
+
+        add(bar, Ui.pill(this, "◀", Ui.GREY, v -> finish()), 0);
+        nameView = Ui.label(this, project.name, 16, Ui.TEXT, true);
+        nameView.setSingleLine(true);
+        nameView.setEllipsize(TextUtils.TruncateAt.END);
+        nameView.setMaxWidth(Ui.dp(170));
+        nameView.setPadding(Ui.dp(10), Ui.dp(6), Ui.dp(10), Ui.dp(6));
+        nameView.setOnClickListener(v -> renameProject());
+        bar.addView(nameView);
+
+        playBtn = big(Ui.pill(this, "▶", Ui.GREY, v -> play()));
+        add(bar, playBtn, 4);
+        add(bar, big(Ui.pill(this, "■", Ui.GREY, v -> stop())), 6);
+        recBtn = big(Ui.pill(this, "●", 0xFF9B1C22, v -> record(false)));
+        add(bar, recBtn, 6);
+        preBtn = big(Ui.pill(this, "", 0xFF9B1C22, v -> record(true)));
+        SpannableString pre = new SpannableString("●\n• • • •");
+        pre.setSpan(new RelativeSizeSpan(0.45f), 2, pre.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        preBtn.setText(pre);
+        preBtn.setLineSpacing(0, 0.8f);
+        add(bar, preBtn, 6);
+
+        metroBtn = Ui.pill(this, "♩ Click", Ui.GREY, v -> {
+            project.metronome = !project.metronome;
+            refreshButtons();
+            pushState();
+        });
+        add(bar, metroBtn, 14);
+        tempoBtn = Ui.pill(this, "", Ui.PANEL2, v -> tempoDialog());
+        add(bar, tempoBtn, 6);
+        add(bar, Ui.pill(this, "Split at cursor", Ui.GREEN, v -> split()), 14);
+        add(bar, Ui.pill(this, "↶ Undo", Ui.GREY, v -> undo()), 6);
+
+        View spacer = new View(this);
+        bar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1));
+
+        statusPill = Ui.label(this, "", 11, 0xFF000000, true);
+        statusPill.setPadding(Ui.dp(12), Ui.dp(5), Ui.dp(12), Ui.dp(5));
+        add(bar, statusPill, 14);
+        add(bar, Ui.pill(this, "Save", Ui.GREEN, v -> { save(); toast("Saved"); }), 10);
+        add(bar, Ui.pill(this, "Export", Ui.GREEN, v -> exportMenu()), 6);
+        add(bar, Ui.pill(this, "Share", Ui.BLUE, v -> shareMenu()), 6);
+        add(bar, Ui.pill(this, "⚙", Ui.GREY, v -> Settings.show(this, store, null)), 6);
+        return hs;
+    }
+
+    private TextView big(TextView t) {
+        t.setTextSize(20);
+        t.setMinWidth(Ui.dp(58));
+        t.setPadding(Ui.dp(12), Ui.dp(4), Ui.dp(12), Ui.dp(4));
+        t.setMinHeight(Ui.dp(48));
+        return t;
+    }
+
+    private void add(LinearLayout bar, View v, int leftMarginDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        lp.leftMargin = Ui.dp(leftMarginDp);
+        bar.addView(v, lp);
+    }
+
+    private View buildStrip() {
+        LinearLayout strip = new LinearLayout(this);
+        strip.setGravity(Gravity.CENTER_VERTICAL);
+        strip.setBackground(Ui.round(Ui.PANEL, 12));
+        strip.setPadding(Ui.dp(12), 0, Ui.dp(8), 0);
+
+        // clip section
+        LinearLayout left = new LinearLayout(this);
+        left.setGravity(Gravity.CENTER_VERTICAL);
+        strip.addView(left, new LinearLayout.LayoutParams(0, MATCH, 1));
+
+        clipHint = Ui.label(this, "Tap a vocal clip to change its pitch  •  Hold a clip or note to delete it  •  Pinch to zoom", 12, Ui.DIM, false);
+        clipHint.setSingleLine(true);
+        clipHint.setEllipsize(TextUtils.TruncateAt.END);
+        left.addView(clipHint, new LinearLayout.LayoutParams(MATCH, WRAP));
+
+        clipBox = new LinearLayout(this);
+        clipBox.setGravity(Gravity.CENTER_VERTICAL);
+        left.addView(clipBox, new LinearLayout.LayoutParams(MATCH, MATCH));
+        clipBox.addView(Ui.label(this, "CLIP PITCH", 11, Ui.DIM, true));
+        pitchSlider = new Ui.Slider(this, -100, 100, 0, 0);
+        LinearLayout.LayoutParams psl = new LinearLayout.LayoutParams(0, MATCH, 1);
+        psl.leftMargin = Ui.dp(8);
+        clipBox.addView(pitchSlider, psl);
+        pitchValue = Ui.label(this, "0 ct", 14, Ui.TEXT, true);
+        pitchValue.setMinWidth(Ui.dp(64));
+        pitchValue.setGravity(Gravity.CENTER);
+        clipBox.addView(pitchValue);
+        pitchSlider.setListener((v, done) -> {
+            int cents = Math.round(v);
+            pitchValue.setText(centsText(cents));
+            if (done) setCents(cents);
+        });
+        TextView reset = Ui.pill(this, "0", Ui.GREY, v -> { pitchSlider.setValue(0); pitchValue.setText(centsText(0)); setCents(0); });
+        clipBox.addView(reset);
+        TextView del = Ui.pill(this, "Delete", 0xFF6B2226, v -> { if (selected != null) deleteClip(selected); });
+        LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(WRAP, WRAP);
+        dl.leftMargin = Ui.dp(6);
+        clipBox.addView(del, dl);
+
+        View sep = new View(this);
+        sep.setBackgroundColor(Ui.LINE);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(Ui.dp(1), Ui.dp(30));
+        sp.leftMargin = Ui.dp(12);
+        sp.rightMargin = Ui.dp(6);
+        strip.addView(sep, sp);
+
+        // keyboard section
+        add(strip, Ui.pill(this, "Quantize", Ui.GREY, v -> quantize()), 4);
+        for (int i = 0; i < 3; i++) {
+            final int inst = i;
+            instBtns[i] = Ui.pill(this, Project.INST_NAMES[i], Ui.GREY, v -> {
+                project.instrument = inst;
+                refreshButtons();
+                pushState();
+                timeline.invalidate();
+            });
+            add(strip, instBtns[i], i == 0 ? 12 : 4);
+        }
+        add(strip, Ui.pill(this, "⬅", Ui.BLUE, v -> shiftOctave(-1)), 12);
+        octaveLabel = Ui.label(this, "", 13, Ui.TEXT, true);
+        octaveLabel.setGravity(Gravity.CENTER);
+        octaveLabel.setMinWidth(Ui.dp(64));
+        strip.addView(octaveLabel);
+        add(strip, Ui.pill(this, "➡", Ui.BLUE, v -> shiftOctave(1)), 0);
+        return strip;
+    }
+
+    // ------------------------------------------------------------ lifecycle
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        engine.start();
+        handler.post(tick);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (project == null) return;
+        if (recording) finishRecording();
+        else engine.post(() -> engine.mixer.stop());
+        keyboard.releaseAll();
+        engine.post(() -> engine.mixer.synth.releaseAll());
+        handler.removeCallbacks(tick);
+        engine.shutdown();
+        engine.mixer.stop();
+        engine.mixer.synth.releaseAll();
+        engine.mixer.seek(project.cursor);
+        save();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        worker.shutdownNow();
+        if (project != null && isFinishing()) store.cleanAudio(project);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+    }
+
+    private void save() { store.saveProject(project, true); }
+
+    private final Runnable tick = new Runnable() {
+        @Override
+        public void run() {
+            Mixer m = engine.mixer;
+            boolean moving = m.playing || m.counting || recording;
+            if (moving) timeline.follow();
+            timeline.invalidate();
+            updateStatus();
+            handler.postDelayed(this, moving ? 30 : 120);
+        }
+    };
+
+    private void updateStatus() {
+        Mixer m = engine.mixer;
+        String s;
+        int col;
+        if (m.counting) {
+            long beat = project.beatLen();
+            s = "COUNT-IN " + Math.min(4, m.countInPos / beat + 1);
+            col = Ui.ORANGE;
+        } else if (recording) {
+            s = "● REC";
+            col = Ui.RED;
+        } else if (m.playing) {
+            s = "PLAYING";
+            col = Ui.BLUE;
+        } else {
+            s = "READY";
+            col = Ui.GREEN;
+        }
+        if (!s.equals(statusPill.getText().toString())) {
+            statusPill.setText(s);
+            statusPill.setBackground(Ui.round(col, 20));
+            statusPill.setTextColor(col == Ui.BLUE || col == Ui.RED ? Ui.TEXT : 0xFF000000);
+        }
+        playBtn.setTextColor(m.playing && !recording ? Ui.GREEN : Ui.TEXT);
+    }
+
+    // ------------------------------------------------------------ audio state
+
+    private void loadSource(String src) {
+        if (audio.containsKey(src)) return;
+        short[] d = store.readAudio(project.id, src);
+        audio.put(src, d);
+        peaks.put(src, computePeaks(d));
+    }
+
+    private static float[] computePeaks(short[] d) {
+        int step = TimelineView.PEAK_STEP;
+        float[] pk = new float[(d.length + step - 1) / step];
+        for (int i = 0; i < pk.length; i++) {
+            int m = 0;
+            int end = Math.min(d.length, (i + 1) * step);
+            for (int j = i * step; j < end; j++) { int v = Math.abs(d[j]); if (v > m) m = v; }
+            pk[i] = Math.min(1f, m / 32768f * 1.15f);
+        }
+        return pk;
+    }
+
+    private Mixer.State buildState() {
+        Mixer.State s = new Mixer.State();
+        List<Mixer.ClipPlay> cps = new ArrayList<>();
+        for (Project.Clip c : project.clips) {
+            short[] d = audio.get(c.src);
+            if (d == null) continue;
+            Mixer.ClipPlay cp = new Mixer.ClipPlay();
+            cp.data = d; cp.srcStart = c.srcStart; cp.len = c.len; cp.start = c.start;
+            if (c.cents != 0) cp.shifted = pitchCache.get(c.cacheKey());
+            cps.add(cp);
+        }
+        s.clips = cps.toArray(new Mixer.ClipPlay[0]);
+        project.sortNotes();
+        Mixer.NotePlay[] ns = new Mixer.NotePlay[project.notes.size()];
+        for (int i = 0; i < ns.length; i++) {
+            Project.Note n = project.notes.get(i);
+            Mixer.NotePlay np = new Mixer.NotePlay();
+            np.pitch = n.pitch; np.vel = n.vel; np.start = n.start; np.end = n.end();
+            ns[i] = np;
+        }
+        s.notes = ns;
+        s.vocalGain = project.vocalMute ? 0 : project.vocalVol * project.vocalVol * 1.4f;
+        s.keysGain = project.keysMute ? 0 : project.keysVol * project.keysVol * 1.4f;
+        s.metronome = project.metronome;
+        s.tempo = project.tempo;
+        s.instrument = project.instrument;
+        return s;
+    }
+
+    private void pushState() { engine.setState(buildState()); }
+
+    private void schedulePitch(Project.Clip c) {
+        if (c.cents == 0) return;
+        String key = c.cacheKey();
+        if (pitchCache.containsKey(key) || pitchPending.contains(key)) return;
+        short[] d = audio.get(c.src);
+        if (d == null) return;
+        pitchPending.add(key);
+        final int st = c.srcStart, len = c.len, cents = c.cents;
+        try {
+            worker.submit(() -> {
+                float[] out = PitchShift.process(d, st, len, cents);
+                runOnUiThread(() -> {
+                    pitchPending.remove(key);
+                    pitchCache.put(key, out);
+                    pushState();
+                    refreshClipBox();
+                });
+            });
+        } catch (Exception ignored) { pitchPending.remove(key); }
+    }
+
+    // ------------------------------------------------------------ transport
+
+    private long latencySamples() { return (long) store.latencyMs() * SR / 1000; }
+
+    private void play() {
+        if (recording) return;
+        Mixer m = engine.mixer;
+        if (m.playing) return;
+        final long from = project.cursor;
+        engine.post(() -> engine.mixer.play(from));
+    }
+
+    private void stop() {
+        if (recording) { finishRecording(); return; }
+        Mixer m = engine.mixer;
+        boolean wasMoving = m.playing || m.counting;
+        if (!wasMoving) project.cursor = 0; // second press: back to the start of the song
+        final long to = project.cursor;
+        engine.post(() -> { engine.mixer.stop(); engine.mixer.seek(to); });
+        timeline.follow();
+    }
+
+    private void record(boolean precount) {
+        if (recording) { finishRecording(); return; }
+        if (!project.vocalArm && !project.keysArm) {
+            toast("Turn on the red record button of a track first");
+            return;
+        }
+        boolean mic = project.vocalArm;
+        if (mic && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+            toast("Allow the microphone, then press record again");
+            return;
+        }
+        beginEdit();
+        selected = null;
+        refreshClipBox();
+        recording = true;
+        recordStart = project.cursor;
+        heldNotes.clear();
+        final Recorder r = mic ? new Recorder() : null;
+        recorder = r;
+        final long from = project.cursor;
+        final boolean waitForMic = r != null && !precount;
+        engine.post(() -> engine.mixer.startWithCountIn(from, precount ? 4 : 0, r, waitForMic));
+        if (r != null) {
+            boolean ok = r.start((AudioManager) getSystemService(AUDIO_SERVICE), () -> engine.post(() -> engine.mixer.signalReady()));
+            if (!ok) {
+                toast("Couldn't open the microphone");
+                recorder = null;
+                engine.post(() -> engine.mixer.signalReady());
+            }
+        }
+        Ui.setPillColor(precount ? preBtn : recBtn, Ui.RED);
+    }
+
+    private void finishRecording() {
+        recording = false;
+        Mixer m = engine.mixer;
+        long now = m.pos;
+        engine.post(() -> engine.mixer.stop());
+        // keyboard notes still held
+        for (Map.Entry<Integer, long[]> e : heldNotes.entrySet()) addRecordedNote(e.getKey(), e.getValue(), notePos(now));
+        heldNotes.clear();
+
+        Recorder r = recorder;
+        recorder = null;
+        if (r != null) {
+            short[] data = r.stop();
+            long mark = r.markCount;
+            if (mark >= 0) {
+                int from = (int) Math.min(data.length, mark + latencySamples());
+                int len = data.length - from;
+                if (len > SR / 5) {
+                    String src = Store.newId();
+                    store.writeAudio(project.id, src, data, data.length);
+                    audio.put(src, data);
+                    peaks.put(src, computePeaks(data));
+                    Project.Clip c = new Project.Clip();
+                    c.src = src; c.srcStart = from; c.len = len; c.start = r.markPos;
+                    makeRoomFor(c);
+                    project.clips.add(c);
+                    selected = c;
+                }
+            }
+        }
+        Ui.setPillColor(recBtn, 0xFF9B1C22);
+        Ui.setPillColor(preBtn, 0xFF9B1C22);
+        final long to = recordStart;
+        project.cursor = to;
+        engine.post(() -> engine.mixer.seek(to));
+        pushState();
+        refreshClipBox();
+        save();
+        timeline.invalidate();
+    }
+
+    /** A new take replaces whatever vocal audio was underneath it. */
+    private void makeRoomFor(Project.Clip n) {
+        long s = n.start, e = n.end();
+        List<Project.Clip> out = new ArrayList<>();
+        for (Project.Clip c : project.clips) {
+            if (c.end() <= s || c.start >= e) { out.add(c); continue; }
+            if (c.start < s) { // keep the part before
+                Project.Clip a = c.copy();
+                a.len = (int) (s - c.start);
+                out.add(a);
+            }
+            if (c.end() > e) { // keep the part after
+                Project.Clip b = c.copy();
+                int cut = (int) (e - c.start);
+                b.srcStart += cut; b.len -= cut; b.start = e;
+                out.add(b);
+            }
+        }
+        project.clips = out;
+        for (Project.Clip c : out) if (c.cents != 0) schedulePitch(c);
+    }
+
+    // ------------------------------------------------------------ keyboard
+
+    private long notePos(long renderedPos) {
+        return Math.max(0, renderedPos - latencySamples() / 2);
+    }
+
+    @Override
+    public void onKeyDown(int note, int vel) {
+        engine.liveNoteOn(note, vel);
+        if (recording && project.keysArm && engine.mixer.playing) {
+            heldNotes.put(note, new long[]{notePos(engine.mixer.pos), vel});
+        }
+    }
+
+    @Override
+    public void onKeyUp(int note) {
+        engine.liveNoteOff(note);
+        long[] h = heldNotes.remove(note);
+        if (h != null && recording) addRecordedNote(note, h, notePos(engine.mixer.pos));
+    }
+
+    private void addRecordedNote(int note, long[] h, long end) {
+        Project.Note n = new Project.Note();
+        n.pitch = note; n.vel = (int) h[1]; n.start = h[0];
+        n.len = Math.max(SR / 40, end - h[0]);
+        project.notes.add(n);
+        project.sortNotes();
+        timeline.invalidate();
+    }
+
+    private void shiftOctave(int d) {
+        project.octave = Math.max(0, Math.min(7, project.octave + d));
+        keyboard.setBaseNote(12 * (project.octave + 1));
+        refreshButtons();
+    }
+
+    // ------------------------------------------------------------ editing
+
+    @Override
+    public void beginEdit() {
+        try {
+            undo.push(project.editsToJson().toString());
+            while (undo.size() > 60) undo.removeLast();
+        } catch (Exception ignored) { }
+    }
+
+    private void undo() {
+        if (recording) return;
+        String s = undo.poll();
+        if (s == null) { toast("Nothing to undo"); return; }
+        try {
+            project.editsFromJson(new JSONObject(s));
+        } catch (Exception ignored) { }
+        selected = null;
+        for (Project.Clip c : project.clips) { loadSource(c.src); if (c.cents != 0) schedulePitch(c); }
+        pushState();
+        refreshClipBox();
+        timeline.invalidate();
+    }
+
+    private void split() {
+        if (recording) return;
+        long cut = engine.mixer.playing ? engine.mixer.pos : project.cursor;
+        Project.Clip target = null;
+        if (selected != null && cut > selected.start && cut < selected.end()) target = selected;
+        else for (Project.Clip c : project.clips) if (cut > c.start + SR / 50 && cut < c.end() - SR / 50) target = c;
+        if (target == null) { toast("Put the cursor over a vocal clip to split it"); return; }
+        beginEdit();
+        int off = (int) (cut - target.start);
+        Project.Clip b = target.copy();
+        b.srcStart += off; b.len -= off; b.start = cut;
+        target.len = off;
+        project.clips.add(project.clips.indexOf(target) + 1, b);
+        selected = b;
+        schedulePitch(target);
+        schedulePitch(b);
+        pushState();
+        refreshClipBox();
+        timeline.invalidate();
+    }
+
+    private void quantize() {
+        if (recording) return;
+        if (project.notes.isEmpty()) { toast("No keyboard notes to quantize"); return; }
+        beginEdit();
+        long grid = project.beatLen() / 4; // 1/16 notes
+        for (Project.Note n : project.notes) {
+            long s = Math.round(n.start / (double) grid) * grid;
+            long e = Math.round(n.end() / (double) grid) * grid;
+            if (e <= s) e = s + grid;
+            n.start = s;
+            n.len = e - s;
+        }
+        project.sortNotes();
+        pushState();
+        timeline.invalidate();
+        toast("Notes snapped to 1/16 — Undo to go back");
+    }
+
+    private void setCents(int cents) {
+        if (selected == null || selected.cents == cents) return;
+        beginEdit();
+        selected.cents = cents;
+        schedulePitch(selected);
+        pushState();
+        refreshClipBox();
+        timeline.invalidate();
+    }
+
+    private static String centsText(int c) { return (c > 0 ? "+" : "") + c + " ct"; }
+
+    private void refreshClipBox() {
+        if (clipBox == null) return;
+        boolean has = selected != null && project.clips.contains(selected);
+        if (!has) selected = null;
+        clipBox.setVisibility(has ? View.VISIBLE : View.GONE);
+        clipHint.setVisibility(has ? View.GONE : View.VISIBLE);
+        if (has) {
+            pitchSlider.setValue(selected.cents);
+            boolean busy = selected.cents != 0 && !pitchCache.containsKey(selected.cacheKey());
+            pitchValue.setText(busy ? "…" : centsText(selected.cents));
+        }
+    }
+
+    private void refreshButtons() {
+        Ui.setPillColor(metroBtn, project.metronome ? Ui.BLUE : Ui.GREY);
+        tempoBtn.setText("Tempo  " + project.tempo);
+        for (int i = 0; i < 3; i++) Ui.setPillColor(instBtns[i], project.instrument == i ? Ui.BLUE : Ui.GREY);
+        octaveLabel.setText("C" + project.octave);
+        nameView.setText(project.name);
+    }
+
+    private void tempoDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(Ui.dp(20), Ui.dp(10), Ui.dp(20), 0);
+        NumberPicker np = new NumberPicker(this);
+        np.setMinValue(80);
+        np.setMaxValue(150);
+        np.setValue(Math.max(80, Math.min(150, project.tempo)));
+        np.setWrapSelectorWheel(false);
+        box.addView(np);
+        Button tap = new Button(this);
+        tap.setText("Tap tempo");
+        final long[] taps = new long[8];
+        final int[] count = {0};
+        tap.setOnClickListener(v -> {
+            long now = System.currentTimeMillis();
+            int n = count[0];
+            if (n > 0 && now - taps[(n - 1) % 8] > 2000) n = 0; // restart after a pause
+            taps[n % 8] = now;
+            n++;
+            count[0] = n;
+            if (n >= 2) {
+                int used = Math.min(n, 8);
+                long first = taps[(n - used) % 8];
+                double avg = (now - first) / (double) (used - 1);
+                int bpm = (int) Math.round(60000 / avg);
+                np.setValue(Math.max(80, Math.min(150, bpm)));
+            }
+        });
+        box.addView(tap);
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Tempo (80–150 BPM)")
+                .setView(box)
+                .setPositiveButton("OK", (d, w) -> {
+                    np.clearFocus();
+                    project.tempo = np.getValue();
+                    refreshButtons();
+                    pushState();
+                    timeline.invalidate();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void renameProject() {
+        android.widget.EditText e = new android.widget.EditText(this);
+        e.setText(project.name);
+        e.setSelectAllOnFocus(true);
+        LinearLayout box = new LinearLayout(this);
+        box.setPadding(Ui.dp(20), Ui.dp(8), Ui.dp(20), 0);
+        box.addView(e, new LinearLayout.LayoutParams(MATCH, WRAP));
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Rename idea")
+                .setView(box)
+                .setPositiveButton("OK", (d, w) -> {
+                    String s = e.getText().toString().trim();
+                    if (!s.isEmpty()) { project.name = s; refreshButtons(); save(); }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    // ------------------------------------------------------------ export & share
+
+    private String safeName() {
+        String s = project.name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+        return s.isEmpty() ? "SongDeck idea" : s;
+    }
+
+    private void exportMenu() {
+        if (recording) return;
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Export")
+                .setItems(new String[]{"Audio file (.wav) — vocal + keyboard mixed", "MIDI file (.mid) — keyboard notes"}, (d, w) -> {
+                    if (w == 0) {
+                        if (project.contentEnd() == 0) { toast("Nothing recorded yet"); return; }
+                        createDoc("audio/wav", safeName() + ".wav", REQ_WAV);
+                    } else {
+                        if (project.notes.isEmpty()) { toast("No keyboard notes to export"); return; }
+                        createDoc("audio/midi", safeName() + ".mid", REQ_MIDI);
+                    }
+                })
+                .show();
+    }
+
+    private void createDoc(String mime, String name, int req) {
+        Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType(mime);
+        i.putExtra(Intent.EXTRA_TITLE, name);
+        try {
+            startActivityForResult(i, req);
+        } catch (Exception e) {
+            toast("No file picker available on this device");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int req, int res, Intent data) {
+        super.onActivityResult(req, res, data);
+        if (res != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        boolean wav = req == REQ_WAV;
+        runExport(wav, () -> getContentResolver().openOutputStream(uri, "w"), () -> toast(wav ? "Audio exported" : "MIDI exported"));
+    }
+
+    private interface StreamOpener { OutputStream open() throws Exception; }
+
+    /** Renders on a background thread with a small progress dialog. */
+    @SuppressWarnings("deprecation")
+    private void runExport(boolean wav, StreamOpener opener, Runnable done) {
+        ProgressDialog pd = new ProgressDialog(this, android.R.style.Theme_Material_Dialog_Alert);
+        pd.setMessage(wav ? "Rendering audio…" : "Writing MIDI…");
+        pd.setCancelable(false);
+        pd.show();
+        // make sure every pitch-shifted clip is ready
+        final List<Project.Clip> need = new ArrayList<>();
+        for (Project.Clip c : project.clips) if (c.cents != 0 && !pitchCache.containsKey(c.cacheKey())) need.add(c.copy());
+        final Project snapshot = copyForExport();
+        new Thread(() -> {
+            String err = null;
+            try {
+                Map<String, float[]> extra = new HashMap<>();
+                for (Project.Clip c : need) {
+                    short[] d = audio.get(c.src);
+                    if (d != null) extra.put(c.cacheKey(), PitchShift.process(d, c.srcStart, c.len, c.cents));
+                }
+                try (OutputStream os = opener.open()) {
+                    if (os == null) throw new Exception("could not open file");
+                    if (wav) {
+                        Mixer.State s = stateFor(snapshot, extra);
+                        Exporter.writeWav(s, Exporter.renderLength(snapshot), os);
+                    } else {
+                        Exporter.writeMidi(snapshot, os);
+                    }
+                }
+                runOnUiThread(() -> pitchCache.putAll(extra));
+            } catch (Exception e) {
+                err = e.getMessage();
+            }
+            final String fe = err;
+            runOnUiThread(() -> {
+                try { pd.dismiss(); } catch (Exception ignored) { }
+                if (fe == null) done.run();
+                else toast("Export failed: " + fe);
+            });
+        }).start();
+    }
+
+    private Project copyForExport() {
+        Project p = new Project();
+        p.name = project.name; p.tempo = project.tempo; p.instrument = project.instrument;
+        p.vocalVol = project.vocalVol; p.keysVol = project.keysVol;
+        p.vocalMute = project.vocalMute; p.keysMute = project.keysMute;
+        for (Project.Clip c : project.clips) p.clips.add(c.copy());
+        for (Project.Note n : project.notes) p.notes.add(n.copy());
+        p.sortNotes();
+        return p;
+    }
+
+    private Mixer.State stateFor(Project p, Map<String, float[]> extra) {
+        Mixer.State s = new Mixer.State();
+        List<Mixer.ClipPlay> cps = new ArrayList<>();
+        for (Project.Clip c : p.clips) {
+            short[] d = audio.get(c.src);
+            if (d == null) continue;
+            Mixer.ClipPlay cp = new Mixer.ClipPlay();
+            cp.data = d; cp.srcStart = c.srcStart; cp.len = c.len; cp.start = c.start;
+            if (c.cents != 0) {
+                cp.shifted = extra.get(c.cacheKey());
+                if (cp.shifted == null) cp.shifted = pitchCache.get(c.cacheKey());
+            }
+            cps.add(cp);
+        }
+        s.clips = cps.toArray(new Mixer.ClipPlay[0]);
+        Mixer.NotePlay[] ns = new Mixer.NotePlay[p.notes.size()];
+        for (int i = 0; i < ns.length; i++) {
+            Project.Note n = p.notes.get(i);
+            Mixer.NotePlay np = new Mixer.NotePlay();
+            np.pitch = n.pitch; np.vel = n.vel; np.start = n.start; np.end = n.end();
+            ns[i] = np;
+        }
+        s.notes = ns;
+        s.vocalGain = p.vocalMute ? 0 : p.vocalVol * p.vocalVol * 1.4f;
+        s.keysGain = p.keysMute ? 0 : p.keysVol * p.keysVol * 1.4f;
+        s.metronome = false;
+        s.tempo = p.tempo;
+        s.instrument = p.instrument;
+        return s;
+    }
+
+    private void shareMenu() {
+        if (recording) return;
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Share")
+                .setItems(new String[]{"Audio clip (.wav)", "MIDI file (.mid)"}, (d, w) -> {
+                    boolean wav = w == 0;
+                    if (wav && project.contentEnd() == 0) { toast("Nothing recorded yet"); return; }
+                    if (!wav && project.notes.isEmpty()) { toast("No keyboard notes to share"); return; }
+                    File dir = ShareProvider.shareDir(this);
+                    File[] old = dir.listFiles();
+                    if (old != null) for (File f : old) f.delete();
+                    File f = new File(dir, safeName() + (wav ? ".wav" : ".mid"));
+                    runExport(wav, () -> new FileOutputStream(f), () -> {
+                        Uri u = ShareProvider.uriFor(f);
+                        Intent i = new Intent(Intent.ACTION_SEND);
+                        i.setType(wav ? "audio/wav" : "audio/midi");
+                        i.putExtra(Intent.EXTRA_STREAM, u);
+                        i.putExtra(Intent.EXTRA_SUBJECT, project.name);
+                        i.setClipData(ClipData.newRawUri(project.name, u));
+                        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivity(Intent.createChooser(i, "Share " + project.name));
+                    });
+                })
+                .show();
+    }
+
+    // ------------------------------------------------------------ TimelineView.Host
+
+    @Override public Project project() { return project; }
+
+    @Override public long playhead() {
+        Mixer m = engine.mixer;
+        return (m.playing || m.counting || recording) ? m.pos : project.cursor;
+    }
+
+    @Override public boolean isPlaying() { return engine.mixer.playing; }
+    @Override public boolean isRecording() { return recording; }
+    @Override public long recordStart() { return recordStart; }
+    @Override public float[] peaks(String src) { return peaks.get(src); }
+    @Override public Project.Clip selected() { return selected; }
+
+    @Override
+    public void select(Project.Clip c) {
+        if (recording) return;
+        selected = c;
+        refreshClipBox();
+    }
+
+    @Override
+    public void seek(long pos) {
+        if (recording) return;
+        project.cursor = Math.max(0, pos);
+        final long p = project.cursor;
+        engine.post(() -> engine.mixer.seek(p));
+    }
+
+    @Override
+    public void deleteClip(Project.Clip c) {
+        if (recording) return;
+        beginEdit();
+        project.clips.remove(c);
+        if (selected == c) selected = null;
+        pushState();
+        refreshClipBox();
+        timeline.invalidate();
+        toast("Clip deleted — Undo brings it back");
+    }
+
+    @Override
+    public void deleteNote(Project.Note n) {
+        if (recording) return;
+        beginEdit();
+        project.notes.remove(n);
+        pushState();
+        timeline.invalidate();
+    }
+
+    @Override
+    public void clipMoved() { pushState(); }
+
+    @Override
+    public void toggleArm(int track) {
+        if (recording) return;
+        if (track == 0) project.vocalArm = !project.vocalArm;
+        else project.keysArm = !project.keysArm;
+    }
+
+    @Override
+    public void toggleMute(int track) {
+        if (track == 0) project.vocalMute = !project.vocalMute;
+        else project.keysMute = !project.keysMute;
+        pushState();
+    }
+
+    @Override
+    public void setVolume(int track, float v, boolean done) {
+        if (track == 0) project.vocalVol = v;
+        else project.keysVol = v;
+        pushState();
+    }
+
+    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+}
