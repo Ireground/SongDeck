@@ -109,15 +109,20 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         root.addView(buildStrip(), sl);
 
         keyboard = new KeyboardView(this);
+        LinearLayout.LayoutParams kb = new LinearLayout.LayoutParams(MATCH, WRAP);
+        kb.topMargin = Ui.dp(6);
+        root.addView(buildKeysBar(), kb);
+
         keyboard.setListener(this);
         keyboard.setBaseNote(12 * (project.octave + 1));
-        LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1.25f);
+        LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
         kl.topMargin = Ui.dp(6);
         root.addView(keyboard, kl);
 
         setContentView(root);
         refreshButtons();
         refreshClipBox();
+        refreshChordUi();
 
         for (Project.Clip c : project.clips) if (c.cents != 0) schedulePitch(c);
         pushState();
@@ -230,15 +235,12 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         dl.leftMargin = Ui.dp(6);
         clipBox.addView(del, dl);
 
-        View sep = new View(this);
-        sep.setBackgroundColor(Ui.LINE);
-        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(Ui.dp(1), Ui.dp(30));
-        sp.leftMargin = Ui.dp(12);
-        sp.rightMargin = Ui.dp(6);
-        strip.addView(sep, sp);
+        return strip;
+    }
 
-        // keyboard section
-        add(strip, Ui.pill(this, "Quantize", Ui.GREY, v -> quantize()), 4);
+    /** Row above the keyboard: sounds, octave, quantize and the one-finger chord controls. */
+    private View buildKeysBar() {
+        Ui.Flow bar = new Ui.Flow(this, 6);
         for (int i = 0; i < 3; i++) {
             final int inst = i;
             instBtns[i] = Ui.pill(this, Project.INST_NAMES[i], Ui.GREY, v -> {
@@ -247,15 +249,97 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
                 pushState();
                 timeline.invalidate();
             });
-            add(strip, instBtns[i], i == 0 ? 12 : 4);
+            bar.addView(instBtns[i]);
         }
-        add(strip, Ui.pill(this, "⬅", Ui.BLUE, v -> shiftOctave(-1)), 12);
+        LinearLayout oct = new LinearLayout(this);
+        oct.setGravity(Gravity.CENTER_VERTICAL);
+        oct.addView(Ui.pill(this, "⬅", Ui.BLUE, v -> shiftOctave(-1)));
         octaveLabel = Ui.label(this, "", 13, Ui.TEXT, true);
         octaveLabel.setGravity(Gravity.CENTER);
-        octaveLabel.setMinWidth(Ui.dp(64));
-        strip.addView(octaveLabel);
-        add(strip, Ui.pill(this, "➡", Ui.BLUE, v -> shiftOctave(1)), 0);
-        return strip;
+        octaveLabel.setMinWidth(Ui.dp(56));
+        oct.addView(octaveLabel);
+        oct.addView(Ui.pill(this, "➡", Ui.BLUE, v -> shiftOctave(1)));
+        bar.addView(oct);
+        bar.addView(Ui.pill(this, "Quantize", Ui.GREY, v -> quantize()));
+
+        chordToggle = Ui.pill(this, "", Ui.GREY, v -> {
+            keyboard.releaseAll();
+            project.chordMode = !project.chordMode;
+            refreshChordUi();
+        });
+        bar.addView(chordToggle);
+
+        chordViews.clear();
+        chordViews.add(stepper(bar, "KEY", () -> chordKeyText(), d -> project.chordKey = (project.chordKey + d + 12) % 12,
+                () -> pickFrom("Key", ChordMaker.KEYS, project.chordKey, i -> project.chordKey = i)));
+        chordViews.add(stepper(bar, "SCALE", () -> ChordMaker.SCALE_NAMES[project.chordScale],
+                d -> project.chordScale = (project.chordScale + d + 9) % 9,
+                () -> pickFrom("Scale", ChordMaker.SCALE_NAMES, project.chordScale, i -> project.chordScale = i)));
+        chordViews.add(stepper(bar, "SHAPE", () -> ChordMaker.SHAPE_NAMES[project.chordShape],
+                d -> project.chordShape = (project.chordShape + d + 6) % 6,
+                () -> pickFrom("Chord shape", ChordMaker.SHAPE_NAMES, project.chordShape, i -> project.chordShape = i)));
+        chordViews.add(stepper(bar, "NOTES", () -> String.valueOf(project.chordNotes), d -> {
+            project.chordNotes = Math.max(1, Math.min(6, project.chordNotes + d));
+            project.chordInv = Math.min(project.chordInv, project.chordNotes - 1);
+        }, null));
+        chordViews.add(stepper(bar, "INVERSION", () -> String.valueOf(project.chordInv),
+                d -> project.chordInv = Math.max(0, Math.min(project.chordNotes - 1, project.chordInv + d)), null));
+        chordName = Ui.label(this, "", 18, Ui.BLUE, true);
+        chordName.setMinWidth(Ui.dp(90));
+        chordName.setGravity(Gravity.CENTER);
+        chordName.setPadding(Ui.dp(10), Ui.dp(4), Ui.dp(10), Ui.dp(4));
+        bar.addView(chordName);
+        chordViews.add(chordName);
+        return bar;
+    }
+
+    private final List<View> chordViews = new ArrayList<>();
+    private final List<Runnable> chordRefreshers = new ArrayList<>();
+    private TextView chordToggle, chordName;
+
+    private String chordKeyText() { return ChordMaker.KEYS[project.chordKey]; }
+
+    /** A small "LABEL ‹ value ›" control. Tapping the value opens the full list when there is one. */
+    private View stepper(Ui.Flow bar, String label, java.util.function.Supplier<String> value,
+                         java.util.function.IntConsumer step, Runnable openList) {
+        LinearLayout box = new LinearLayout(this);
+        box.setGravity(Gravity.CENTER_VERTICAL);
+        box.setBackground(Ui.round(Ui.PANEL, 10));
+        box.setPadding(Ui.dp(10), Ui.dp(2), Ui.dp(4), Ui.dp(2));
+        box.addView(Ui.label(this, label, 10, Ui.DIM, true));
+        TextView minus = Ui.pill(this, "‹", Ui.GREY, v -> { step.accept(-1); refreshChordUi(); });
+        minus.setMinWidth(Ui.dp(40));
+        LinearLayout.LayoutParams mp = new LinearLayout.LayoutParams(WRAP, WRAP);
+        mp.leftMargin = Ui.dp(8);
+        box.addView(minus, mp);
+        TextView val = Ui.label(this, "", 14, Ui.TEXT, true);
+        val.setGravity(Gravity.CENTER);
+        val.setMinWidth(Ui.dp(label.equals("SCALE") ? 130 : label.equals("SHAPE") ? 105 : 34));
+        val.setPadding(Ui.dp(6), Ui.dp(8), Ui.dp(6), Ui.dp(8));
+        if (openList != null) val.setOnClickListener(v -> openList.run());
+        box.addView(val);
+        box.addView(Ui.pill(this, "›", Ui.GREY, v -> { step.accept(1); refreshChordUi(); }), new LinearLayout.LayoutParams(WRAP, WRAP));
+        ((TextView) box.getChildAt(3)).setMinWidth(Ui.dp(40));
+        chordRefreshers.add(() -> val.setText(value.get()));
+        bar.addView(box);
+        return box;
+    }
+
+    private void pickFrom(String title, String[] items, int current, java.util.function.IntConsumer set) {
+        new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle(title)
+                .setSingleChoiceItems(items, current, (d, w) -> { set.accept(w); d.dismiss(); refreshChordUi(); })
+                .show();
+    }
+
+    private void refreshChordUi() {
+        boolean on = project.chordMode;
+        chordToggle.setText(on ? "One-finger chords: ON" : "One-finger chords: OFF");
+        Ui.setPillColor(chordToggle, on ? Ui.BLUE : Ui.GREY);
+        for (View v : chordViews) v.setVisibility(on ? View.VISIBLE : View.GONE);
+        for (Runnable r : chordRefreshers) r.run();
+        if (on && chordName.getText().length() == 0) chordName.setText("Play a key");
+        keyboard.setScale(on ? project.chordKey : -1, project.chordScale);
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -542,19 +626,53 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         return Math.max(0, renderedPos - latencySamples() / 2);
     }
 
+    // Keys pressed -> notes sounding. With one-finger chords a key makes several notes;
+    // a note shared by two held chords keeps sounding until both keys are released.
+    private final Map<Integer, int[]> keyChords = new HashMap<>();
+    private final int[] noteRefs = new int[128];
+
     @Override
-    public void onKeyDown(int note, int vel) {
-        engine.liveNoteOn(note, vel);
-        if (recording && project.keysArm && engine.mixer.playing) {
-            heldNotes.put(note, new long[]{notePos(engine.mixer.pos), vel});
+    public void onKeyDown(int key, int vel) {
+        if (keyChords.containsKey(key)) onKeyUp(key);
+        int[] notes;
+        if (project.chordMode) {
+            int[] root = new int[1];
+            notes = ChordMaker.build(key, project.chordKey, project.chordScale, project.chordShape,
+                    project.chordNotes, project.chordInv, root);
+            chordName.setText(ChordMaker.name(notes, root[0]));
+        } else {
+            notes = new int[]{key};
+        }
+        keyChords.put(key, notes);
+        for (int n : notes) {
+            if (n < 0 || n > 127) continue;
+            if (noteRefs[n]++ == 0) noteStart(n, vel);
         }
     }
 
     @Override
-    public void onKeyUp(int note) {
-        engine.liveNoteOff(note);
-        long[] h = heldNotes.remove(note);
-        if (h != null && recording) addRecordedNote(note, h, notePos(engine.mixer.pos));
+    public void onKeyUp(int key) {
+        int[] notes = keyChords.remove(key);
+        if (notes == null) return;
+        for (int n : notes) {
+            if (n < 0 || n > 127 || noteRefs[n] <= 0) continue;
+            if (--noteRefs[n] == 0) noteEnd(n);
+        }
+    }
+
+    private void noteStart(int n, int vel) {
+        engine.liveNoteOn(n, vel);
+        if (project.chordMode) keyboard.setLit(n, true);
+        if (recording && project.keysArm && engine.mixer.playing) {
+            heldNotes.put(n, new long[]{notePos(engine.mixer.pos), vel});
+        }
+    }
+
+    private void noteEnd(int n) {
+        engine.liveNoteOff(n);
+        keyboard.setLit(n, false);
+        long[] h = heldNotes.remove(n);
+        if (h != null && recording) addRecordedNote(n, h, notePos(engine.mixer.pos));
     }
 
     private void addRecordedNote(int note, long[] h, long end) {

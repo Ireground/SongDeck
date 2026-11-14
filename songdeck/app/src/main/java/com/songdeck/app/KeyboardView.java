@@ -23,7 +23,9 @@ public class KeyboardView extends View {
 
     private Listener listener;
     private int baseNote = 48; // C3
-    private int whiteCount = 8;
+    private int whiteCount = 15;
+    private final boolean[] lit = new boolean[128];
+    private int scaleKey = -1, scaleIdx;
     private final SparseIntArray pointerNote = new SparseIntArray();
     private final boolean[] down = new boolean[128];
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -43,6 +45,17 @@ public class KeyboardView extends View {
 
     public int getBaseNote() { return baseNote; }
 
+    /** Notes currently sounding (lit in blue), e.g. the chord a single key produced. */
+    public void setLit(int note, boolean on) {
+        if (note >= 0 && note < 128) { lit[note] = on; invalidate(); }
+    }
+
+    /** Show scale dots on the keys (key = -1 hides them). */
+    public void setScale(int key, int scale) {
+        scaleKey = key; scaleIdx = scale;
+        invalidate();
+    }
+
     public void releaseAll() {
         pointerNote.clear();
         for (int n = 0; n < 128; n++) if (down[n]) keyUp(n);
@@ -51,7 +64,7 @@ public class KeyboardView extends View {
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        whiteCount = 8; // one octave, C to the next C: big keys for big fingers
+        whiteCount = 15; // two octaves, C to C
     }
 
     private int whiteNote(int i) {
@@ -154,23 +167,28 @@ public class KeyboardView extends View {
             whiteGrad = new LinearGradient(0, 0, 0, H, 0xFFDCDFE4, 0xFFFFFFFF, Shader.TileMode.CLAMP);
             gradH = H;
         }
-        p.setTextSize(Ui.dp(16));
-        p.setFakeBoldText(true);
+        p.setTextSize(Ui.dp(12));
         p.setTextAlign(Paint.Align.CENTER);
         for (int i = 0; i < whiteCount; i++) {
             int n = whiteNote(i);
             r.set(i * w + gap / 2, 0, (i + 1) * w - gap / 2, H);
-            if (n <= 127 && down[n]) {
+            if (n <= 127 && (down[n] || lit[n])) {
                 p.setShader(null);
-                p.setColor(0xFF9CC2FF);
+                p.setColor(down[n] ? 0xFF9CC2FF : 0xFFBFD6FF);
             } else {
                 p.setShader(whiteGrad);
             }
             c.drawRoundRect(r, Ui.dp(5), Ui.dp(5), p);
             p.setShader(null);
-            String[] names = {"C", "D", "E", "F", "G", "A", "B"};
-            p.setColor(i % 7 == 0 ? Ui.BLUE : 0xFF7A8290);
-            c.drawText(i % 7 == 0 ? "C" + (n / 12 - 1) : names[i % 7], r.centerX(), H - Ui.dp(14), p);
+            if (i % 7 == 0) {
+                p.setColor(0xFF7A8290);
+                c.drawText("C" + (n / 12 - 1), r.centerX(), H - Ui.dp(12), p);
+            }
+            if (scaleKey >= 0 && n <= 127 && ChordMaker.inScale(n, scaleKey, scaleIdx)) {
+                boolean root = (n - scaleKey) % 12 == 0;
+                p.setColor(root ? Ui.BLUE : 0xFF9A86F0);
+                c.drawCircle(r.centerX(), H - Ui.dp(32), Ui.dp(root ? 5 : 4), p);
+            }
         }
         float blackH = H * 0.6f, blackW = w * 0.62f;
         for (int i = 0; i < whiteCount; i++) {
@@ -179,9 +197,15 @@ public class KeyboardView extends View {
             int n = whiteNote(i) + 1;
             float bx = (i + 1) * w - blackW / 2;
             r.set(bx, -Ui.dp(6), bx + blackW, blackH);
-            p.setColor(n <= 127 && down[n] ? Ui.BLUE : 0xFF15171B);
+            boolean on = n <= 127 && (down[n] || lit[n]);
+            p.setColor(on ? Ui.BLUE : 0xFF15171B);
             c.drawRoundRect(r, Ui.dp(5), Ui.dp(5), p);
-            if (!(n <= 127 && down[n])) {
+            if (scaleKey >= 0 && n <= 127 && ChordMaker.inScale(n, scaleKey, scaleIdx)) {
+                boolean root = (n - scaleKey) % 12 == 0;
+                p.setColor(on ? 0xFF10302D : (root ? Ui.BLUE : 0xFF9A86F0));
+                c.drawCircle(bx + blackW / 2, blackH - Ui.dp(24), Ui.dp(root ? 4.5f : 3.5f), p);
+            }
+            if (!on) {
                 p.setColor(0xFF2E323A);
                 r.set(bx + blackW * 0.15f, blackH - Ui.dp(14), bx + blackW * 0.85f, blackH - Ui.dp(5));
                 c.drawRoundRect(r, Ui.dp(3), Ui.dp(3), p);

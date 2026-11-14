@@ -30,6 +30,10 @@ public class Project {
     public boolean vocalArm = true, keysArm = true;
     public long cursor;                 // where playback starts
 
+    // one-finger chords
+    public boolean chordMode;
+    public int chordKey = 0, chordScale = 0, chordShape = 0, chordNotes = 3, chordInv = 0;
+
     public List<Clip> clips = new ArrayList<>();
     public List<Note> notes = new ArrayList<>();
 
@@ -127,6 +131,8 @@ public class Project {
         o.put("octave", octave); o.put("vocalVol", vocalVol); o.put("keysVol", keysVol);
         o.put("vocalMute", vocalMute); o.put("keysMute", keysMute);
         o.put("vocalArm", vocalArm); o.put("keysArm", keysArm); o.put("cursor", cursor);
+        o.put("chordMode", chordMode); o.put("chordKey", chordKey); o.put("chordScale", chordScale);
+        o.put("chordShape", chordShape); o.put("chordNotes", chordNotes); o.put("chordInv", chordInv);
         return o;
     }
 
@@ -141,6 +147,10 @@ public class Project {
         p.vocalMute = o.optBoolean("vocalMute", false); p.keysMute = o.optBoolean("keysMute", false);
         p.vocalArm = o.optBoolean("vocalArm", true); p.keysArm = o.optBoolean("keysArm", true);
         p.cursor = o.optLong("cursor", 0);
+        p.chordMode = o.optBoolean("chordMode", false);
+        p.chordKey = o.optInt("chordKey", 0); p.chordScale = o.optInt("chordScale", 0);
+        p.chordShape = o.optInt("chordShape", 0); p.chordNotes = o.optInt("chordNotes", 3);
+        p.chordInv = o.optInt("chordInv", 0);
         p.editsFromJson(o);
         return p;
     }
