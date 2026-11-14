@@ -23,7 +23,7 @@ public class KeyboardView extends View {
 
     private Listener listener;
     private int baseNote = 48; // C3
-    private int whiteCount = 15;
+    private int whiteCount = 8;
     private final SparseIntArray pointerNote = new SparseIntArray();
     private final boolean[] down = new boolean[128];
     private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -51,8 +51,7 @@ public class KeyboardView extends View {
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        int byWidth = Math.round(w / (float) Ui.dp(54));
-        whiteCount = Math.max(8, Math.min(36, byWidth));
+        whiteCount = 8; // one octave, C to the next C: big keys for big fingers
     }
 
     private int whiteNote(int i) {
@@ -155,7 +154,8 @@ public class KeyboardView extends View {
             whiteGrad = new LinearGradient(0, 0, 0, H, 0xFFDCDFE4, 0xFFFFFFFF, Shader.TileMode.CLAMP);
             gradH = H;
         }
-        p.setTextSize(Ui.dp(11));
+        p.setTextSize(Ui.dp(16));
+        p.setFakeBoldText(true);
         p.setTextAlign(Paint.Align.CENTER);
         for (int i = 0; i < whiteCount; i++) {
             int n = whiteNote(i);
@@ -168,10 +168,9 @@ public class KeyboardView extends View {
             }
             c.drawRoundRect(r, Ui.dp(5), Ui.dp(5), p);
             p.setShader(null);
-            if (i % 7 == 0) {
-                p.setColor(0xFF7A8290);
-                c.drawText("C" + (n / 12 - 1), r.centerX(), H - Ui.dp(10), p);
-            }
+            String[] names = {"C", "D", "E", "F", "G", "A", "B"};
+            p.setColor(i % 7 == 0 ? Ui.BLUE : 0xFF7A8290);
+            c.drawText(i % 7 == 0 ? "C" + (n / 12 - 1) : names[i % 7], r.centerX(), H - Ui.dp(14), p);
         }
         float blackH = H * 0.6f, blackW = w * 0.62f;
         for (int i = 0; i < whiteCount; i++) {

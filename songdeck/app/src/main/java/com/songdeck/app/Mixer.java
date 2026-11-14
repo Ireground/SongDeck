@@ -81,6 +81,7 @@ public final class Mixer {
         countInPos = 0;
         counting = beats > 0;
         waitingForStart = waitForSignal;
+        if (!counting && !waitingForStart) startTransport(); // no count-in, no mic: go right away
     }
 
     /** Called when the microphone has delivered its first audio. */
@@ -183,7 +184,7 @@ public final class Mixer {
             boolean down = (b % 4) == 0;
             double f = down ? 1760 : 1175;
             double tt = inBeat / (double) SR;
-            float v = (float) (Math.sin(2 * Math.PI * f * tt) * Math.exp(-tt * 90)) * (down ? 0.55f : 0.4f);
+            float v = (float) (Math.sin(2 * Math.PI * f * tt) * Math.exp(-tt * 90)) * (down ? 0.8f : 0.6f);
             out[2 * i] += v;
             out[2 * i + 1] += v;
         }

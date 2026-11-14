@@ -21,7 +21,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
-import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.NumberPicker;
 import android.widget.TextView;
@@ -49,7 +48,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
     private static final int SR = Project.SR;
     private static final int WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
-    private static final int REQ_MIC = 1, REQ_WAV = 10, REQ_MIDI = 11;
+    private static final int REQ_MIC = 1, REQ_EXPORT = 10;
 
     private Store store;
     private Project project;
@@ -101,7 +100,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
 
         timeline = new TimelineView(this);
         timeline.setHost(this);
-        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(MATCH, 0, 1.15f);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
         tl.topMargin = Ui.dp(6);
         root.addView(timeline, tl);
 
@@ -112,7 +111,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         keyboard = new KeyboardView(this);
         keyboard.setListener(this);
         keyboard.setBaseNote(12 * (project.octave + 1));
-        LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1.25f);
         kl.topMargin = Ui.dp(6);
         root.addView(keyboard, kl);
 
@@ -130,56 +129,51 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
     }
 
     private View buildToolbar() {
-        HorizontalScrollView hs = new HorizontalScrollView(this);
-        hs.setHorizontalScrollBarEnabled(false);
-        hs.setFillViewport(true);
-        LinearLayout bar = new LinearLayout(this);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        hs.addView(bar, new ViewGroup.LayoutParams(MATCH, WRAP));
+        Ui.Flow bar = new Ui.Flow(this, 6);
 
-        add(bar, Ui.pill(this, "◀", Ui.GREY, v -> finish()), 0);
+        bar.addView(Ui.pill(this, "◀ Ideas", Ui.GREY, v -> finish()));
         nameView = Ui.label(this, project.name, 16, Ui.TEXT, true);
         nameView.setSingleLine(true);
         nameView.setEllipsize(TextUtils.TruncateAt.END);
         nameView.setMaxWidth(Ui.dp(170));
-        nameView.setPadding(Ui.dp(10), Ui.dp(6), Ui.dp(10), Ui.dp(6));
+        nameView.setPadding(Ui.dp(6), Ui.dp(6), Ui.dp(10), Ui.dp(6));
         nameView.setOnClickListener(v -> renameProject());
         bar.addView(nameView);
 
+        bar.addView(big(Ui.pill(this, "⏮", Ui.GREY, v -> backToStart())));
         playBtn = big(Ui.pill(this, "▶", Ui.GREY, v -> play()));
-        add(bar, playBtn, 4);
-        add(bar, big(Ui.pill(this, "■", Ui.GREY, v -> stop())), 6);
+        bar.addView(playBtn);
+        bar.addView(big(Ui.pill(this, "■", Ui.GREY, v -> stop())));
         recBtn = big(Ui.pill(this, "●", 0xFF9B1C22, v -> record(false)));
-        add(bar, recBtn, 6);
+        bar.addView(recBtn);
         preBtn = big(Ui.pill(this, "", 0xFF9B1C22, v -> record(true)));
         SpannableString pre = new SpannableString("●\n• • • •");
         pre.setSpan(new RelativeSizeSpan(0.45f), 2, pre.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         preBtn.setText(pre);
         preBtn.setLineSpacing(0, 0.8f);
-        add(bar, preBtn, 6);
+        bar.addView(preBtn);
 
-        metroBtn = Ui.pill(this, "♩ Click", Ui.GREY, v -> {
+        metroBtn = big(Ui.pill(this, "", Ui.GREY, v -> {
             project.metronome = !project.metronome;
             refreshButtons();
             pushState();
-        });
-        add(bar, metroBtn, 14);
-        tempoBtn = Ui.pill(this, "", Ui.PANEL2, v -> tempoDialog());
-        add(bar, tempoBtn, 6);
-        add(bar, Ui.pill(this, "Split at cursor", Ui.GREEN, v -> split()), 14);
-        add(bar, Ui.pill(this, "↶ Undo", Ui.GREY, v -> undo()), 6);
-
-        View spacer = new View(this);
-        bar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1));
+        }));
+        metroBtn.setTextSize(14);
+        bar.addView(metroBtn);
+        tempoBtn = big(Ui.pill(this, "", Ui.PANEL2, v -> tempoDialog()));
+        tempoBtn.setTextSize(14);
+        bar.addView(tempoBtn);
+        bar.addView(Ui.pill(this, "Split at cursor", Ui.GREEN, v -> split()));
+        bar.addView(Ui.pill(this, "↶ Undo", Ui.GREY, v -> undo()));
 
         statusPill = Ui.label(this, "", 11, 0xFF000000, true);
         statusPill.setPadding(Ui.dp(12), Ui.dp(5), Ui.dp(12), Ui.dp(5));
-        add(bar, statusPill, 14);
-        add(bar, Ui.pill(this, "Save", Ui.GREEN, v -> { save(); toast("Saved"); }), 10);
-        add(bar, Ui.pill(this, "Export", Ui.GREEN, v -> exportMenu()), 6);
-        add(bar, Ui.pill(this, "Share", Ui.BLUE, v -> shareMenu()), 6);
-        add(bar, Ui.pill(this, "⚙", Ui.GREY, v -> Settings.show(this, store, null)), 6);
-        return hs;
+        bar.addView(statusPill);
+        bar.addView(Ui.pill(this, "Save", Ui.GREEN, v -> { save(); toast("Saved"); }));
+        bar.addView(Ui.pill(this, "Export", Ui.GREEN, v -> exportMenu()));
+        bar.addView(Ui.pill(this, "Share", Ui.BLUE, v -> shareMenu()));
+        bar.addView(Ui.pill(this, "⚙", Ui.GREY, v -> Settings.show(this, store, null)));
+        return bar;
     }
 
     private TextView big(TextView t) {
@@ -426,6 +420,15 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         engine.post(() -> engine.mixer.play(from));
     }
 
+    /** Jumps to the very beginning of the song, like the Home key. */
+    private void backToStart() {
+        if (recording) return;
+        project.cursor = 0;
+        engine.post(() -> engine.mixer.seek(0));
+        timeline.follow();
+        timeline.invalidate();
+    }
+
     private void stop() {
         if (recording) { finishRecording(); return; }
         Mixer m = engine.mixer;
@@ -659,6 +662,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
 
     private void refreshButtons() {
         Ui.setPillColor(metroBtn, project.metronome ? Ui.BLUE : Ui.GREY);
+        metroBtn.setText(project.metronome ? "Metronome ON" : "Metronome OFF");
         tempoBtn.setText("Tempo  " + project.tempo);
         for (int i = 0; i < 3; i++) Ui.setPillColor(instBtns[i], project.instrument == i ? Ui.BLUE : Ui.GREY);
         octaveLabel.setText("C" + project.octave);
@@ -735,18 +739,33 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         return s.isEmpty() ? "SongDeck idea" : s;
     }
 
+    // What to render: the full mix, the vocal track alone, or the keyboard track as MIDI.
+    private static final int KIND_MIX = 0, KIND_VOCAL = 1, KIND_MIDI = 2;
+    private static final String[] KIND_LABELS = {
+            "Mix — vocal + keyboard (audio .wav)",
+            "Vocal Track only (audio .wav)",
+            "Keyboard Track only (MIDI .mid)"};
+
+    private boolean canRender(int kind) {
+        if (kind == KIND_MIDI && project.notes.isEmpty()) { toast("No keyboard notes yet"); return false; }
+        if (kind == KIND_VOCAL && project.clips.isEmpty()) { toast("No vocal recorded yet"); return false; }
+        if (kind == KIND_MIX && project.contentEnd() == 0) { toast("Nothing recorded yet"); return false; }
+        return true;
+    }
+
+    private String fileName(int kind) {
+        if (kind == KIND_MIDI) return safeName() + " - Keyboard.mid";
+        if (kind == KIND_VOCAL) return safeName() + " - Vocal.wav";
+        return safeName() + " - Mix.wav";
+    }
+
     private void exportMenu() {
         if (recording) return;
         new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                .setTitle("Export")
-                .setItems(new String[]{"Audio file (.wav) — vocal + keyboard mixed", "MIDI file (.mid) — keyboard notes"}, (d, w) -> {
-                    if (w == 0) {
-                        if (project.contentEnd() == 0) { toast("Nothing recorded yet"); return; }
-                        createDoc("audio/wav", safeName() + ".wav", REQ_WAV);
-                    } else {
-                        if (project.notes.isEmpty()) { toast("No keyboard notes to export"); return; }
-                        createDoc("audio/midi", safeName() + ".mid", REQ_MIDI);
-                    }
+                .setTitle("Export to a file")
+                .setItems(KIND_LABELS, (d, w) -> {
+                    if (!canRender(w)) return;
+                    createDoc(w == KIND_MIDI ? "audio/midi" : "audio/wav", fileName(w), REQ_EXPORT + w);
                 })
                 .show();
     }
@@ -768,15 +787,17 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         super.onActivityResult(req, res, data);
         if (res != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
-        boolean wav = req == REQ_WAV;
-        runExport(wav, () -> getContentResolver().openOutputStream(uri, "w"), () -> toast(wav ? "Audio exported" : "MIDI exported"));
+        int kind = req - REQ_EXPORT;
+        if (kind < 0 || kind > 2) return;
+        runExport(kind, () -> getContentResolver().openOutputStream(uri, "w"), () -> toast("Exported: " + fileName(kind)));
     }
 
     private interface StreamOpener { OutputStream open() throws Exception; }
 
     /** Renders on a background thread with a small progress dialog. */
     @SuppressWarnings("deprecation")
-    private void runExport(boolean wav, StreamOpener opener, Runnable done) {
+    private void runExport(int kind, StreamOpener opener, Runnable done) {
+        boolean wav = kind != KIND_MIDI;
         ProgressDialog pd = new ProgressDialog(this, android.R.style.Theme_Material_Dialog_Alert);
         pd.setMessage(wav ? "Rendering audio…" : "Writing MIDI…");
         pd.setCancelable(false);
@@ -796,7 +817,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
                 try (OutputStream os = opener.open()) {
                     if (os == null) throw new Exception("could not open file");
                     if (wav) {
-                        Mixer.State s = stateFor(snapshot, extra);
+                        Mixer.State s = stateFor(snapshot, extra, kind == KIND_VOCAL);
                         Exporter.writeWav(s, Exporter.renderLength(snapshot), os);
                     } else {
                         Exporter.writeMidi(snapshot, os);
@@ -826,7 +847,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         return p;
     }
 
-    private Mixer.State stateFor(Project p, Map<String, float[]> extra) {
+    private Mixer.State stateFor(Project p, Map<String, float[]> extra, boolean vocalOnly) {
         Mixer.State s = new Mixer.State();
         List<Mixer.ClipPlay> cps = new ArrayList<>();
         for (Project.Clip c : p.clips) {
@@ -848,9 +869,9 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
             np.pitch = n.pitch; np.vel = n.vel; np.start = n.start; np.end = n.end();
             ns[i] = np;
         }
-        s.notes = ns;
-        s.vocalGain = p.vocalMute ? 0 : p.vocalVol * p.vocalVol * 1.4f;
-        s.keysGain = p.keysMute ? 0 : p.keysVol * p.keysVol * 1.4f;
+        s.notes = vocalOnly ? new Mixer.NotePlay[0] : ns;
+        s.vocalGain = (p.vocalMute && !vocalOnly) ? 0 : p.vocalVol * p.vocalVol * 1.4f;
+        s.keysGain = (p.keysMute || vocalOnly) ? 0 : p.keysVol * p.keysVol * 1.4f;
         s.metronome = false;
         s.tempo = p.tempo;
         s.instrument = p.instrument;
@@ -861,23 +882,22 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         if (recording) return;
         new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
                 .setTitle("Share")
-                .setItems(new String[]{"Audio clip (.wav)", "MIDI file (.mid)"}, (d, w) -> {
-                    boolean wav = w == 0;
-                    if (wav && project.contentEnd() == 0) { toast("Nothing recorded yet"); return; }
-                    if (!wav && project.notes.isEmpty()) { toast("No keyboard notes to share"); return; }
+                .setItems(KIND_LABELS, (d, w) -> {
+                    if (!canRender(w)) return;
+                    boolean wav = w != KIND_MIDI;
                     File dir = ShareProvider.shareDir(this);
                     File[] old = dir.listFiles();
                     if (old != null) for (File f : old) f.delete();
-                    File f = new File(dir, safeName() + (wav ? ".wav" : ".mid"));
-                    runExport(wav, () -> new FileOutputStream(f), () -> {
+                    File f = new File(dir, fileName(w));
+                    runExport(w, () -> new FileOutputStream(f), () -> {
                         Uri u = ShareProvider.uriFor(f);
                         Intent i = new Intent(Intent.ACTION_SEND);
                         i.setType(wav ? "audio/wav" : "audio/midi");
                         i.putExtra(Intent.EXTRA_STREAM, u);
-                        i.putExtra(Intent.EXTRA_SUBJECT, project.name);
-                        i.setClipData(ClipData.newRawUri(project.name, u));
+                        i.putExtra(Intent.EXTRA_SUBJECT, f.getName());
+                        i.setClipData(ClipData.newRawUri(f.getName(), u));
                         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                        startActivity(Intent.createChooser(i, "Share " + project.name));
+                        startActivity(Intent.createChooser(i, "Share " + f.getName()));
                     });
                 })
                 .show();

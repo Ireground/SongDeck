@@ -92,6 +92,64 @@ public final class Ui {
         return t;
     }
 
+    /** Lays children left to right and wraps to a new line when they don't fit, so nothing is ever hidden. */
+    public static class Flow extends android.view.ViewGroup {
+        private final int gap;
+
+        public Flow(Context c, int gapDp) {
+            super(c);
+            gap = dp(gapDp);
+        }
+
+        @Override
+        protected void onMeasure(int ws, int hs) {
+            int maxW = MeasureSpec.getSize(ws) - getPaddingLeft() - getPaddingRight();
+            int x = 0, y = 0, rowH = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View ch = getChildAt(i);
+                if (ch.getVisibility() == GONE) continue;
+                ch.measure(MeasureSpec.makeMeasureSpec(maxW, MeasureSpec.AT_MOST),
+                        MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                int cw = ch.getMeasuredWidth(), chh = ch.getMeasuredHeight();
+                if (x > 0 && x + cw > maxW) { x = 0; y += rowH + gap; rowH = 0; }
+                x += cw + gap;
+                rowH = Math.max(rowH, chh);
+            }
+            setMeasuredDimension(MeasureSpec.getSize(ws), y + rowH + getPaddingTop() + getPaddingBottom());
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int l, int t, int r, int b) {
+            int maxW = r - l - getPaddingLeft() - getPaddingRight();
+            int n = getChildCount();
+            int i = 0, y = getPaddingTop();
+            while (i < n) {
+                // collect one row
+                int x = 0, rowH = 0, j = i;
+                while (j < n) {
+                    View ch = getChildAt(j);
+                    if (ch.getVisibility() == GONE) { j++; continue; }
+                    int cw = ch.getMeasuredWidth();
+                    if (x > 0 && x + cw > maxW) break;
+                    x += cw + gap;
+                    rowH = Math.max(rowH, ch.getMeasuredHeight());
+                    j++;
+                }
+                if (j == i) j = i + 1;
+                int cx = getPaddingLeft();
+                for (int k = i; k < j; k++) {
+                    View ch = getChildAt(k);
+                    if (ch.getVisibility() == GONE) continue;
+                    int cy = y + (rowH - ch.getMeasuredHeight()) / 2;
+                    ch.layout(cx, cy, cx + ch.getMeasuredWidth(), cy + ch.getMeasuredHeight());
+                    cx += ch.getMeasuredWidth() + gap;
+                }
+                y += rowH + gap;
+                i = j;
+            }
+        }
+    }
+
     /** Slim horizontal slider. */
     public static class Slider extends View {
         public interface Listener { void onChange(float value, boolean done); }
