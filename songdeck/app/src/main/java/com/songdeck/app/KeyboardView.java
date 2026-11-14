@@ -45,6 +45,13 @@ public class KeyboardView extends View {
 
     public int getBaseNote() { return baseNote; }
 
+    /** 1 or 2 octaves on screen (C to C). */
+    public void setOctaves(int n) {
+        releaseAll();
+        whiteCount = n <= 1 ? 8 : 15;
+        invalidate();
+    }
+
     /** Notes currently sounding (lit in blue), e.g. the chord a single key produced. */
     public void setLit(int note, boolean on) {
         if (note >= 0 && note < 128) { lit[note] = on; invalidate(); }
@@ -64,7 +71,7 @@ public class KeyboardView extends View {
 
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
-        whiteCount = 15; // two octaves, C to C
+
     }
 
     private int whiteNote(int i) {

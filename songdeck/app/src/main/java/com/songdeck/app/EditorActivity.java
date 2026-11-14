@@ -115,6 +115,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
 
         keyboard.setListener(this);
         keyboard.setBaseNote(12 * (project.octave + 1));
+        keyboard.setOctaves(project.keyOctaves);
         LinearLayout.LayoutParams kl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
         kl.topMargin = Ui.dp(6);
         root.addView(keyboard, kl);
@@ -260,6 +261,12 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         oct.addView(octaveLabel);
         oct.addView(Ui.pill(this, "➡", Ui.BLUE, v -> shiftOctave(1)));
         bar.addView(oct);
+        sizeToggle = Ui.pill(this, "", Ui.GREY, v -> {
+            project.keyOctaves = project.keyOctaves == 1 ? 2 : 1;
+            keyboard.setOctaves(project.keyOctaves);
+            refreshButtons();
+        });
+        bar.addView(sizeToggle);
         bar.addView(Ui.pill(this, "Quantize", Ui.GREY, v -> quantize()));
 
         chordToggle = Ui.pill(this, "", Ui.GREY, v -> {
@@ -295,7 +302,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
 
     private final List<View> chordViews = new ArrayList<>();
     private final List<Runnable> chordRefreshers = new ArrayList<>();
-    private TextView chordToggle, chordName;
+    private TextView chordToggle, chordName, sizeToggle;
 
     private String chordKeyText() { return ChordMaker.KEYS[project.chordKey]; }
 
@@ -784,6 +791,7 @@ public class EditorActivity extends Activity implements TimelineView.Host, Keybo
         tempoBtn.setText("Tempo  " + project.tempo);
         for (int i = 0; i < 3; i++) Ui.setPillColor(instBtns[i], project.instrument == i ? Ui.BLUE : Ui.GREY);
         octaveLabel.setText("C" + project.octave);
+        sizeToggle.setText(project.keyOctaves == 1 ? "Keys: 1 octave" : "Keys: 2 octaves");
         nameView.setText(project.name);
     }
 
